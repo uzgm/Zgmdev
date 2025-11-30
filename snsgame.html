@@ -1,0 +1,594 @@
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SNS 피하기 게임 - 개선판</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        #gameContainer {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+            cursor: none;
+        }
+
+        #character {
+            width: 70px;
+            height: 70px;
+            background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
+            border-radius: 50%;
+            position: absolute;
+            pointer-events: none;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3), 0 0 20px rgba(76, 175, 80, 0.5);
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 35px;
+            border: 3px solid rgba(255,255,255,0.3);
+        }
+
+        #character.hit {
+            animation: hitEffect 0.3s;
+            background: linear-gradient(135deg, #ff4444 0%, #cc0000 100%);
+        }
+
+        @keyframes hitEffect {
+            0%, 100% { transform: scale(1) rotate(0deg); }
+            25% { transform: scale(1.3) rotate(-10deg); }
+            75% { transform: scale(1.3) rotate(10deg); }
+        }
+
+        .sns-item {
+            width: 60px;
+            height: 60px;
+            position: absolute;
+            font-size: 45px;
+            pointer-events: none;
+            animation: fall linear;
+            filter: drop-shadow(0 4px 8px rgba(0,0,0,0.3));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        @keyframes fall {
+            from { 
+                transform: translateY(-60px) rotate(0deg);
+            }
+            to { 
+                transform: translateY(100vh) rotate(360deg);
+            }
+        }
+
+        #ui {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            color: white;
+            font-weight: bold;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+            z-index: 200;
+            background: rgba(0,0,0,0.3);
+            padding: 20px;
+            border-radius: 15px;
+            backdrop-filter: blur(10px);
+        }
+
+        #timer {
+            margin-top: 10px;
+            font-size: 36px;
+            color: #FFD700;
+            text-align: center;
+        }
+
+        #health {
+            margin-top: 10px;
+            font-size: 32px;
+        }
+
+        #score {
+            font-size: 24px;
+            margin-top: 10px;
+            color: #4CAF50;
+        }
+
+        #combo {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 48px;
+            color: #FFD700;
+            font-weight: bold;
+            text-shadow: 3px 3px 6px rgba(0,0,0,0.8);
+            z-index: 250;
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        @keyframes comboShow {
+            0% { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
+            50% { opacity: 1; transform: translate(-50%, -50%) scale(1.2); }
+            100% { opacity: 0; transform: translate(-50%, -50%) scale(1); }
+        }
+
+        #startScreen, #resultScreen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(0,0,0,0.95);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            color: white;
+            z-index: 300;
+        }
+
+        #startScreen {
+            justify-content: center;
+        }
+
+        #startScreen h1 {
+            font-size: 56px;
+            margin-bottom: 20px;
+            text-shadow: 3px 3px 6px rgba(0,0,0,0.5);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .difficulty {
+            font-size: 32px;
+            color: #ff4444;
+            font-weight: bold;
+            margin-bottom: 30px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        #startScreen p {
+            font-size: 22px;
+            margin-bottom: 40px;
+            text-align: center;
+            max-width: 700px;
+            line-height: 1.8;
+        }
+
+        button {
+            padding: 18px 50px;
+            font-size: 26px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            font-weight: bold;
+        }
+
+        button:hover {
+            transform: translateY(-3px) scale(1.05);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.4);
+        }
+
+        button:active {
+            transform: translateY(-1px) scale(1.02);
+        }
+
+        #resultScreen {
+            display: none;
+            opacity: 0;
+            justify-content: flex-start;
+            overflow-y: auto;
+            padding: 40px 20px;
+            transition: opacity 0.8s ease;
+        }
+
+        #resultScreen.show {
+            display: flex;
+            opacity: 1;
+        }
+
+        #resultScreen h2 {
+            font-size: 48px;
+            margin-bottom: 30px;
+            text-shadow: 3px 3px 6px rgba(0,0,0,0.5);
+        }
+
+        .result-stats {
+            background: rgba(255,255,255,0.1);
+            padding: 30px;
+            border-radius: 20px;
+            margin: 20px 0;
+            width: 700px;
+            max-width: 90%;
+            backdrop-filter: blur(10px);
+        }
+
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            margin: 15px 0;
+            font-size: 22px;
+            padding: 15px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 10px;
+            transition: all 0.3s;
+        }
+
+        .stat-item:hover {
+            background: rgba(255,255,255,0.1);
+            transform: translateX(5px);
+        }
+
+        .stat-item span:first-child {
+            font-weight: bold;
+        }
+
+        .recommendation {
+            background: rgba(255,215,0,0.2);
+            padding: 30px;
+            border-radius: 15px;
+            margin: 20px 0;
+            width: 700px;
+            max-width: 90%;
+            border: 2px solid #FFD700;
+        }
+
+        .recommendation h3 {
+            color: #FFD700;
+            margin-bottom: 15px;
+            font-size: 26px;
+        }
+
+        .recommendation p {
+            line-height: 1.8;
+            font-size: 20px;
+        }
+
+        .warning {
+            background: rgba(255,68,68,0.2);
+            padding: 25px;
+            border-radius: 15px;
+            margin: 20px 0;
+            width: 700px;
+            max-width: 90%;
+            border: 2px solid #ff4444;
+        }
+
+        .warning h3 {
+            color: #ff4444;
+            margin-bottom: 15px;
+            font-size: 26px;
+        }
+
+        .warning p {
+            font-size: 20px;
+            line-height: 1.6;
+        }
+
+        .particle {
+            position: absolute;
+            pointer-events: none;
+            z-index: 150;
+        }
+
+        @keyframes particleFloat {
+            0% {
+                transform: translate(0, 0) scale(1);
+                opacity: 1;
+            }
+            100% {
+                transform: translate(var(--x), var(--y)) scale(0);
+                opacity: 0;
+            }
+        }
+
+        #progressBar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 5px;
+            background: linear-gradient(90deg, #4CAF50 0%, #FFD700 100%);
+            transition: width 1s linear;
+            z-index: 201;
+            box-shadow: 0 2px 10px rgba(76, 175, 80, 0.5);
+        }
+    </style>
+</head>
+<body>
+    <div id="progressBar"></div>
+    
+    <div id="startScreen">
+        <h1>🎮 SNS 피하기 게임</h1>
+        <div class="difficulty">⚡ 고난이도 모드 ⚡</div>
+        <p>
+            🖱️ 마우스를 움직여 캐릭터를 조종하고<br>
+            위에서 떨어지는 SNS 아이콘들을 피하세요!<br>
+            60초 동안 최대한 많이 피해보세요!<br>
+            <span style="color: #ff4444;">❤️ 체력이 0이 되면 게임이 끝납니다</span><br><br>
+            <span style="color: #FFD700;">⚡ SNS가 2배 빠르게 쏟아집니다!</span><br>
+            <span style="color: #FFD700;">🚀 낙하 속도도 2배 빨라집니다!</span><br>
+            <span style="color: #4CAF50;">🎯 연속으로 피하면 콤보 점수!</span>
+        </p>
+        <button onclick="startGame()">게임 시작 🚀</button>
+    </div>
+
+    <div id="gameContainer">
+        <div id="ui">
+            <div id="health">❤️❤️❤️❤️❤️</div>
+            <div id="timer">60</div>
+            <div id="score">피한 횟수: <span id="dodgeCount">0</span></div>
+            <div id="comboDisplay" style="font-size:18px;margin-top:10px;color:#FFD700;">콤보: <span id="comboCount">0</span></div>
+        </div>
+        <div id="character">🛡️</div>
+        <div id="combo"></div>
+    </div>
+
+    <div id="resultScreen">
+        <h2 id="resultTitle">🎮 게임 종료!</h2>
+        <div class="result-stats">
+            <div class="stat-item"><span>⏱️ 생존 시간:</span><span id="survivalTime">0</span></div>
+            <div class="stat-item"><span>🎯 피한 횟수:</span><span id="finalDodge">0</span></div>
+            <div class="stat-item"><span>🔥 최고 콤보:</span><span id="maxCombo">0</span></div>
+            <div class="stat-item"><span>📱 TikTok 충돌:</span><span id="tiktokCount">0</span></div>
+            <div class="stat-item"><span>📷 Instagram 충돌:</span><span id="instagramCount">0</span></div>
+            <div class="stat-item"><span>🎬 YouTube 충돌:</span><span id="youtubeCount">0</span></div>
+            <div class="stat-item"><span>🐦 Twitter 충돌:</span><span id="twitterCount">0</span></div>
+        </div>
+        
+        <div class="warning">
+            <h3>⚠️ SNS 중독 경고!</h3>
+            <p id="warningText"></p>
+        </div>
+        
+        <div class="recommendation">
+            <h3>💡 해결방안 및 조언</h3>
+            <p id="recommendationText"></p>
+        </div>
+        
+        <button onclick="location.reload()">다시 하기 🔄</button>
+    </div>
+
+    <script>
+        const snsTypes = [
+            { name: 'TikTok', emoji: '📱' },
+            { name: 'Instagram', emoji: '📷' },
+            { name: 'YouTube', emoji: '🎬' },
+            { name: 'Twitter', emoji: '🐦' }
+        ];
+
+        let health = 5;
+        let timeLeft = 60;
+        let gameActive = false;
+        let dodgeCount = 0;
+        let combo = 0;
+        let maxCombo = 0;
+        let startTime;
+        const snsStats = { TikTok: 0, Instagram: 0, YouTube: 0, Twitter: 0 };
+
+        const character = document.getElementById('character');
+        const gameContainer = document.getElementById('gameContainer');
+        const comboDisplay = document.getElementById('combo');
+        const progressBar = document.getElementById('progressBar');
+        
+        let characterX = window.innerWidth / 2;
+        let characterY = window.innerHeight / 2;
+
+        // 부드러운 캐릭터 이동
+        document.addEventListener('mousemove', (e) => {
+            if (gameActive) {
+                characterX = e.clientX;
+                characterY = e.clientY;
+                character.style.left = (characterX - 35) + 'px';
+                character.style.top = (characterY - 35) + 'px';
+            }
+        });
+
+        function startGame() {
+            document.getElementById('startScreen').style.display = 'none';
+            gameActive = true;
+            startTime = Date.now();
+
+            const spawnInterval = setInterval(() => {
+                if (!gameActive) {
+                    clearInterval(spawnInterval);
+                } else {
+                    spawnSNS();
+                }
+            }, 140);
+
+            const timerInterval = setInterval(() => {
+                timeLeft--;
+                document.getElementById('timer').textContent = timeLeft;
+                progressBar.style.width = ((60 - timeLeft) / 60 * 100) + '%';
+                
+                if (timeLeft <= 0) {
+                    clearInterval(timerInterval);
+                    endGame(true);
+                }
+            }, 1000);
+        }
+
+        function spawnSNS() {
+            const sns = snsTypes[Math.floor(Math.random() * snsTypes.length)];
+            const item = document.createElement('div');
+            item.className = 'sns-item';
+            item.textContent = sns.emoji;
+            item.dataset.type = sns.name;
+            item.style.left = Math.random() * (window.innerWidth - 60) + 'px';
+            item.style.top = '-60px';
+
+            const duration = 1.2 + Math.random() * 0.8;
+            item.style.animationDuration = duration + 's';
+            gameContainer.appendChild(item);
+
+            const collisionCheck = setInterval(() => {
+                if (!gameActive || !item.parentElement) {
+                    clearInterval(collisionCheck);
+                    return;
+                }
+
+                const r1 = item.getBoundingClientRect();
+                const r2 = character.getBoundingClientRect();
+
+                if (!(r1.right < r2.left || r1.left > r2.right || 
+                      r1.bottom < r2.top || r1.top > r2.bottom)) {
+                    health--;
+                    snsStats[sns.name]++;
+                    combo = 0;
+                    document.getElementById('comboCount').textContent = combo;
+                    updateHealth();
+                    
+                    character.classList.add('hit');
+                    createParticles(characterX, characterY, '#ff4444');
+                    
+                    setTimeout(() => {
+                        character.classList.remove('hit');
+                    }, 300);
+                    
+                    item.remove();
+                    clearInterval(collisionCheck);
+                    
+                    if (health <= 0) {
+                        endGame(false);
+                    }
+                }
+            }, 16);
+
+            setTimeout(() => {
+                if (item.parentElement) {
+                    dodgeCount++;
+                    combo++;
+                    
+                    if (combo > maxCombo) {
+                        maxCombo = combo;
+                    }
+                    
+                    document.getElementById('dodgeCount').textContent = dodgeCount;
+                    document.getElementById('comboCount').textContent = combo;
+                    
+                    if (combo > 0 && combo % 10 === 0) {
+                        showCombo(combo);
+                    }
+                    
+                    createParticles(
+                        parseFloat(item.style.left), 
+                        window.innerHeight, 
+                        '#4CAF50'
+                    );
+                    
+                    item.remove();
+                }
+                clearInterval(collisionCheck);
+            }, duration * 1000);
+        }
+
+        function createParticles(x, y, color) {
+            for (let i = 0; i < 8; i++) {
+                const particle = document.createElement('div');
+                particle.className = 'particle';
+                particle.textContent = '✨';
+                particle.style.left = x + 'px';
+                particle.style.top = y + 'px';
+                particle.style.color = color;
+                particle.style.fontSize = (Math.random() * 20 + 15) + 'px';
+                
+                const angle = (Math.PI * 2 * i) / 8;
+                const distance = Math.random() * 50 + 30;
+                particle.style.setProperty('--x', Math.cos(angle) * distance + 'px');
+                particle.style.setProperty('--y', Math.sin(angle) * distance + 'px');
+                
+                particle.style.animation = 'particleFloat 0.6s ease-out forwards';
+                
+                gameContainer.appendChild(particle);
+                
+                setTimeout(() => particle.remove(), 600);
+            }
+        }
+
+        function showCombo(count) {
+            comboDisplay.textContent = `🔥 ${count} COMBO! 🔥`;
+            comboDisplay.style.animation = 'comboShow 1s ease-out';
+            
+            setTimeout(() => {
+                comboDisplay.style.animation = '';
+            }, 1000);
+        }
+
+        function updateHealth() {
+            const hearts = '❤️'.repeat(health) + '🖤'.repeat(5 - health);
+            document.getElementById('health').innerHTML = hearts;
+        }
+
+        function endGame(survived) {
+            gameActive = false;
+            const survivalTime = Math.floor((Date.now() - startTime) / 1000);
+
+            document.getElementById('resultTitle').textContent = survived ? '🎉 완벽한 생존!' : '💀 게임 오버!';
+            document.getElementById('survivalTime').textContent = survivalTime + '초';
+            document.getElementById('finalDodge').textContent = dodgeCount + '회';
+            document.getElementById('maxCombo').textContent = maxCombo + '회';
+            document.getElementById('tiktokCount').textContent = snsStats.TikTok + '회';
+            document.getElementById('instagramCount').textContent = snsStats.Instagram + '회';
+            document.getElementById('youtubeCount').textContent = snsStats.YouTube + '회';
+            document.getElementById('twitterCount').textContent = snsStats.Twitter + '회';
+
+            const total = Object.values(snsStats).reduce((a, b) => a + b, 0);
+            const most = Object.keys(snsStats).reduce((a, b) => snsStats[a] > snsStats[b] ? a : b);
+
+            if (total > 0) {
+                document.getElementById('warningText').innerHTML = 
+                    `총 <strong>${total}번</strong> SNS와 충돌했습니다. 특히 <strong>${most}</strong>에 ${snsStats[most]}번 부딪혔네요. 현실에서도 ${most}에 많은 시간을 보내고 있지 않나요?`;
+            } else {
+                document.getElementById('warningText').innerHTML = 
+                    '🎉 모든 SNS를 완벽하게 피했습니다! 훌륭한 자제력입니다!';
+            }
+
+            let recommendation = '';
+            if (total === 0) {
+                recommendation = '✨ 완벽합니다! SNS와 건강한 거리를 유지하고 계시네요. 이 균형을 계속 유지하세요!';
+            } else if (total <= 2) {
+                recommendation = '👍 좋은 균형입니다. 하지만 조금 더 신중하게 SNS를 사용하면 더욱 좋겠습니다.';
+            } else if (total <= 5) {
+                recommendation = `⚠️ <strong>${most}</strong> 사용 시간을 줄이고, 스크린 타임 제한 기능을 활용해보세요. 하루 1-2시간으로 제한하는 것을 추천합니다.`;
+            } else {
+                recommendation = `🚨 <strong>${most}</strong>에 많이 노출되고 있습니다. 앱 알림을 끄고, 특정 시간대에만 사용하는 등 디지털 디톡스가 필요합니다. 취미 활동이나 운동으로 대체해보세요.`;
+            }
+
+            document.getElementById('recommendationText').innerHTML = recommendation;
+
+            const resultScreen = document.getElementById('resultScreen');
+            resultScreen.classList.add('show');
+        }
+
+        // 초기 위치 설정
+        character.style.left = (characterX - 35) + 'px';
+        character.style.top = (characterY - 35) + 'px';
+        updateHealth();
+    </script>
+</body>
+</html>
