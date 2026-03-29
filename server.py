@@ -1,12 +1,3 @@
-"""
-
-server.py — 권위적 서버 (Authoritative Server)
-
-AI 로직은 ai_manager.py로 완전 분리
-
-"""
-
-
 import asyncio, json, os, time, random, math
 
 from contextlib import asynccontextmanager
