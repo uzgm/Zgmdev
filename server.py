@@ -12,8 +12,7 @@ AI FSM → ai_manager.py
 
 [수정 내역]
 - cancel_session: match_id 제거 + status를 idle로 완전 초기화
-  → 파티원 재입장 루프 버그 수정 (버그1)
-  → 같은 계정 두 번째 매칭 시 AI 안 붙는 버그 수정 (버그)
+- trigger_match: orderBy 쿼리 제거 → 전체 조회 후 서버 필터 (Firebase 인덱스 불필요)
 """
 
 import asyncio, json, os, time, random, math
@@ -42,10 +41,10 @@ REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 WS_PORT     = int(os.environ.get("PORT", 7860))
 WS_PING_INTERVAL = 20
 
-TEAM_SIZE     = 4
-SESSION_TTL   = 300
-JOIN_TIMEOUT  = 30.0
-AI_FILL_DELAY = 10.0
+TEAM_SIZE      = 4
+SESSION_TTL    = 300
+JOIN_TIMEOUT   = 30.0
+AI_FILL_DELAY  = 10.0
 SYNC_TICK_RATE = 10
 MAX_MOVE_SPEED = 6.5
 KO_REVIVE_TIME = 20.0
@@ -56,10 +55,13 @@ MAP_MIN_Z = -9.0;  MAP_MAX_Z = 9.0
 ZONE_POS    = {"x": 0.0, "z": 0.0}
 ZONE_RADIUS = 4.0
 
-# ★ 단일 진실 공급원: ai_manager에서 가져옴
 WEAPON_STATS = _AI_WEAPON_STATS
 WEAPONS = list(WEAPON_STATS.keys())
 MAPS    = ["default"]
+
+print(f"=== httpx 사용: {_USE_HTTPX} ===", flush=True)
+print(f"=== RTDB_SECRET 길이: {len(RTDB_SECRET)} ===", flush=True)
+print(f"=== REDIS_URL: {REDIS_URL[:30] if REDIS_URL else '없음'} ===", flush=True)
 
 # ================================================================
 clients: dict  = {}
@@ -75,7 +77,7 @@ _trigger_match_running: bool = False
 async def lifespan(app: FastAPI):
     global _http_client
     if _USE_HTTPX:
-        _http_client = httpx.AsyncClient(timeout=2.0)
+        _http_client = httpx.AsyncClient(timeout=5.0)
     yield
     if _http_client:
         await _http_client.aclose()
@@ -89,6 +91,7 @@ async def _get(url: str) -> dict | None:
     try:
         if _USE_HTTPX and _http_client:
             r = await _http_client.get(url)
+            print(f"[HTTP GET] status={r.status_code} url={url[:80]}", flush=True)
             return r.json() if r.status_code == 200 else None
         else:
             import urllib.request as ur
@@ -96,7 +99,8 @@ async def _get(url: str) -> dict | None:
             raw  = await loop.run_in_executor(None, lambda: ur.urlopen(url, timeout=5).read())
             return json.loads(raw)
     except Exception as e:
-        print(f"[HTTP GET 오류] {e}", flush=True); return None
+        print(f"[HTTP GET 오류] {type(e).__name__}: {e}", flush=True)
+        return None
 
 async def _put(url: str, data) -> bool:
     try:
@@ -113,7 +117,8 @@ async def _put(url: str, data) -> bool:
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
             return True
     except Exception as e:
-        print(f"[HTTP PUT 오류] {e}", flush=True); return False
+        print(f"[HTTP PUT 오류] {type(e).__name__}: {e}", flush=True)
+        return False
 
 async def _patch(url: str, data) -> bool:
     try:
@@ -130,7 +135,8 @@ async def _patch(url: str, data) -> bool:
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
             return True
     except Exception as e:
-        print(f"[HTTP PATCH 오류] {e}", flush=True); return False
+        print(f"[HTTP PATCH 오류] {type(e).__name__}: {e}", flush=True)
+        return False
 
 async def _delete(url: str):
     try:
@@ -142,7 +148,7 @@ async def _delete(url: str):
             req  = ur.Request(url, method="DELETE")
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
     except Exception as e:
-        print(f"[HTTP DELETE 오류] {e}", flush=True)
+        print(f"[HTTP DELETE 오류] {type(e).__name__}: {e}", flush=True)
 
 # ================================================================
 # Redis
@@ -163,7 +169,9 @@ async def redis_set(key, value, ex=SESSION_TTL) -> bool:
                               headers=_redis_headers(), method="POST")
             raw  = await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5).read())
             return json.loads(raw).get("result") == "OK"
-    except: return False
+    except Exception as e:
+        print(f"[Redis SET 오류] {type(e).__name__}: {e}", flush=True)
+        return False
 
 async def redis_get(key):
     try:
@@ -180,7 +188,9 @@ async def redis_get(key):
                 lambda: json.loads(ur.urlopen(req, timeout=5).read()))
             raw  = data.get("result")
         return json.loads(raw) if raw else None
-    except: return None
+    except Exception as e:
+        print(f"[Redis GET 오류] {type(e).__name__}: {e}", flush=True)
+        return None
 
 async def redis_del(key):
     try:
@@ -193,7 +203,8 @@ async def redis_del(key):
             req  = ur.Request(REDIS_URL, data=body.encode(),
                               headers=_redis_headers(), method="POST")
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
-    except: pass
+    except Exception as e:
+        print(f"[Redis DEL 오류] {type(e).__name__}: {e}", flush=True)
 
 # ================================================================
 # RTDB
@@ -251,7 +262,7 @@ def check_attack_cooldown(uid: str, weapon: str) -> bool:
     return True
 
 # ================================================================
-# 브로드캐스트 (asyncio.gather 병렬)
+# 브로드캐스트
 # ================================================================
 async def broadcast(mid: str, msg: dict, exclude: str | None = None):
     data    = json.dumps(msg, ensure_ascii=False)
@@ -341,7 +352,7 @@ async def sync_loop(mid: str):
                     "an": p.get("an", "idle"),
                     "hp": p.get("hp", 100),
                     "ko": p.get("ko", False),
-                    "tm": p.get("tm", "r"),   # ★ 클라 AI 팀 판별용
+                    "tm": p.get("tm", "r"),
                 }
         if delta:
             await broadcast(mid, {"t": "sv", "pos": delta, "ts": int(time.time()*1000)})
@@ -364,7 +375,7 @@ async def ko_timer(mid: str, uid: str):
     await broadcast(mid, {"t": "rev", "uid": uid, "hp": 30, "penalty": True, "auto": True})
 
 # ================================================================
-# 공격 처리 (Anti-Cheat: 사거리 + 쿨다운 재검증)
+# 공격 처리
 # ================================================================
 async def process_attack(mid: str, attacker_uid: str, msg: dict):
     if mid not in sessions: return
@@ -493,11 +504,12 @@ async def trigger_match():
     try:
         await asyncio.sleep(0.5)
         async with match_lock:
-            url  = (_rtdb("match_queue/parties").replace(".json", "")
-                    + f'.json?auth={RTDB_SECRET}&orderBy="status"&equalTo="searching"')
-            data = await _get(url)
+            # ★ orderBy 쿼리 제거 → 전체 조회 후 서버에서 필터 (Firebase 인덱스 불필요)
+            data = await rtdb_get("match_queue/parties")
+            print(f"[trigger_match] RTDB 조회 결과: {type(data)} 파티수={len(data) if data else 0}", flush=True)
             if not data or not isinstance(data, dict): return
             ta, tb = try_match(data)
+            print(f"[trigger_match] ta={ta} tb={tb}", flush=True)
             if ta: await create_match(ta, tb)
     finally:
         _trigger_match_running = False
@@ -522,6 +534,7 @@ async def create_match(ta, tb):
     if not await redis_set(f"s:{mid}", {"mid": mid, "status": "loading",
                                          "team_red": a_uids, "team_blue": b_uids,
                                          "map_id": sel_map, "created_at": int(time.time())}):
+        print(f"[Match] Redis 저장 실패 → 매치 취소", flush=True)
         return
 
     for p in ta: await rtdb_patch(f"match_queue/parties/{p['id']}",
@@ -564,7 +577,7 @@ async def create_match(ta, tb):
         "status":          "loading",
         "party_ids":       a_pids + b_pids,
     }
-    print(f"[Match] {mid} 등록 (실:{len(real_uids)} AI:{len(ai_uids)})", flush=True)
+    print(f"[Match] {mid} 등록 완료 (실:{len(real_uids)} AI:{len(ai_uids)})", flush=True)
     asyncio.create_task(watch_timeout(mid))
 
 async def watch_timeout(mid):
@@ -574,9 +587,7 @@ async def watch_timeout(mid):
     await cancel_session(mid)
 
 # ================================================================
-# ★ [수정] cancel_session
-#   - match_id, assigned_team 제거 + status를 "idle"로 완전 초기화
-#   - 파티원 재입장 루프 버그(버그1) + 두 번째 매칭 AI 안 붙는 버그(버그2) 동시 수정
+# cancel_session
 # ================================================================
 async def cancel_session(mid):
     if mid not in sessions: return
@@ -587,7 +598,6 @@ async def cancel_session(mid):
         if pid.startswith("ai_party_"):
             await rtdb_delete(f"match_queue/parties/{pid}")
         else:
-            # ★ 수정: match_id 제거 + status를 idle로 완전 초기화
             await rtdb_patch(f"match_queue/parties/{pid}", {
                 "match_id":      "",
                 "assigned_team": "",
@@ -609,7 +619,7 @@ async def check_all_weapons_selected(mid):
         "map_id":    s.get("map_id", "default"),
         "r":         s["team_red"],
         "b":         s["team_blue"],
-        "team_red":  s["team_red"],    # ★ 클라 AI 팀 판별용
+        "team_red":  s["team_red"],
         "team_blue": s["team_blue"],
     })
     rd = await redis_get(f"s:{mid}")
@@ -618,7 +628,7 @@ async def check_all_weapons_selected(mid):
         await redis_set(f"s:{mid}", rd)
 
     asyncio.create_task(sync_loop(mid))
-    asyncio.create_task(run_ai_loop(mid, sessions, broadcast, ko_timer))  # ★ AI 위임
+    asyncio.create_task(run_ai_loop(mid, sessions, broadcast, ko_timer))
 
 # ================================================================
 # WebSocket
@@ -637,6 +647,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             if t == "q":
                 uid = msg.get("u", "")
+                print(f"[q] 매칭 요청: {uid}", flush=True)
                 asyncio.create_task(trigger_match())
                 asyncio.create_task(ai_fill_later(uid))
                 await ws.send_text(json.dumps({"t": "w"}))
@@ -689,17 +700,17 @@ async def websocket_endpoint(ws: WebSocket):
 
                 snap = build_snapshot(mid, uid)
                 await ws.send_text(json.dumps({
-                    "t":         "js",
-                    "u":         uid,
-                    "tm":        team,
-                    "sp":        spawn,
-                    "sn":        snap,
-                    "cn":        cn,
-                    "ex":        ex,
+                    "t":        "js",
+                    "u":        uid,
+                    "tm":       team,
+                    "sp":       spawn,
+                    "sn":       snap,
+                    "cn":       cn,
+                    "ex":       ex,
                     "ai_weapons":  s["weapons"],
-                    "map_id":    s.get("map_id", "default"),
+                    "map_id":   s.get("map_id", "default"),
                     "reconnect": s["status"] == "in_game",
-                    "team_red":  s["team_red"],    # ★ 클라 AI 팀 판별용
+                    "team_red":  s["team_red"],
                     "team_blue": s["team_blue"],
                 }))
                 await broadcast(mid, {"t": "sp", "u": uid, "tm": team,
@@ -717,7 +728,6 @@ async def websocket_endpoint(ws: WebSocket):
                 if weapon not in WEAPON_STATS: weapon = "baguette"
                 s["weapons"][uid] = {"weapon": weapon, **WEAPON_STATS[weapon]}
                 s["weapon_selected"].add(uid)
-                # ★ cooldown 포함 → 클라가 서버 값으로 동기화
                 await ws.send_text(json.dumps({
                     "t":        "w_ok",
                     "weapon":   weapon,
@@ -746,7 +756,6 @@ async def websocket_endpoint(ws: WebSocket):
                 clients[uid]["last_pos_time"] = time.time()
 
                 if not valid:
-                    # ★ force=True → 클라가 Lerp 없이 즉시 위치 교정
                     await send_to(uid, {"t": "rb",
                                         "x": pos["x"], "y": pos["y"], "z": pos["z"],
                                         "force": True})
@@ -779,6 +788,7 @@ async def health():
         "clients":  len(clients),
         "sessions": len(sessions),
         "httpx":    _USE_HTTPX,
+        "rtdb_secret_len": len(RTDB_SECRET),
     }
 
 if __name__ == "__main__":
