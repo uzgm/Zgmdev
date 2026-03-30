@@ -26,7 +26,8 @@ TEAM_SIZE      = 4
 SESSION_TTL    = 300
 JOIN_TIMEOUT   = 30.0
 AI_FILL_DELAY  = 10.0
-SYNC_TICK_RATE = 10
+SYNC_TICK_RATE = 10   # 클라이언트 sync 주기 (Hz)
+AI_TICK_RATE   = 10   # ★ AI도 동일하게 맞춤 (끊김 방지)
 MAX_MOVE_SPEED = 6.5
 KO_REVIVE_TIME = 20.0
 RESCUE_WINDOW  = 10.0
@@ -51,18 +52,9 @@ _http_client = None
 _trigger_match_running: bool = False
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _http_client
-    if _USE_HTTPX:
-        _http_client = httpx.AsyncClient(timeout=5.0)
-    yield
-    if _http_client:
-        await _http_client.aclose()
-
-app = FastAPI(lifespan=lifespan)
-
-
+# ================================================================
+# HTTP 헬퍼
+# ================================================================
 async def _get(url: str):
     try:
         if _USE_HTTPX and _http_client:
@@ -127,6 +119,9 @@ async def _delete(url: str):
         print(f"[HTTP DELETE 오류] {type(e).__name__}: {e}", flush=True)
 
 
+# ================================================================
+# Redis 헬퍼
+# ================================================================
 def _redis_headers():
     return {"Authorization": f"Bearer {REDIS_TOKEN}", "Content-Type": "application/json"}
 
@@ -181,6 +176,9 @@ async def redis_del(key):
         print(f"[Redis DEL 오류] {type(e).__name__}: {e}", flush=True)
 
 
+# ================================================================
+# RTDB 헬퍼
+# ================================================================
 def _rtdb(path): return f"{RTDB_URL}{path}.json?auth={RTDB_SECRET}"
 
 async def rtdb_get(path):      return await _get(_rtdb(path))
@@ -189,6 +187,49 @@ async def rtdb_patch(path, d): return await _patch(_rtdb(path), d)
 async def rtdb_delete(path):   await _delete(_rtdb(path))
 
 
+# ================================================================
+# ★ 서버 시작 시 RTDB 잔여 파티 정리 (유령 세션 방지)
+# ================================================================
+async def cleanup_stale_rtdb():
+    print("[Startup] RTDB 잔여 파티 정리 시작...", flush=True)
+    data = await rtdb_get("match_queue/parties")
+    if not data or not isinstance(data, dict):
+        print("[Startup] 정리할 파티 없음", flush=True)
+    else:
+        removed = 0
+        for pid, pp in data.items():
+            status = pp.get("status", "")
+            # ai_party 또는 matched 상태는 이전 서버 잔여 → 삭제
+            if pid.startswith("ai_party_") or status == "matched":
+                await rtdb_delete(f"match_queue/parties/{pid}")
+                removed += 1
+                print(f"[Startup] 파티 제거: {pid} (status={status})", flush=True)
+            elif status not in ("searching", "idle", ""):
+                await rtdb_delete(f"match_queue/parties/{pid}")
+                removed += 1
+                print(f"[Startup] 파티 제거(unknown): {pid} (status={status})", flush=True)
+        print(f"[Startup] 파티 {removed}개 제거 완료", flush=True)
+    # active_matches는 메모리가 초기화됐으니 전부 삭제
+    await rtdb_delete("active_matches")
+    print("[Startup] active_matches 초기화 완료", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http_client
+    if _USE_HTTPX:
+        _http_client = httpx.AsyncClient(timeout=5.0)
+    await cleanup_stale_rtdb()  # ★ 시작 시 정리
+    yield
+    if _http_client:
+        await _http_client.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+
+# ================================================================
+# 게임 로직 유틸
+# ================================================================
 def dist_2d(a: dict, b: dict) -> float:
     return math.sqrt((a.get("x",0)-b.get("x",0))**2 + (a.get("z",0)-b.get("z",0))**2)
 
@@ -222,6 +263,9 @@ def check_attack_cooldown(uid: str, weapon: str) -> bool:
     return True
 
 
+# ================================================================
+# 브로드캐스트
+# ================================================================
 async def broadcast(mid: str, msg: dict, exclude=None):
     data    = json.dumps(msg, ensure_ascii=False)
     targets = [(uid, info) for uid, info in list(clients.items())
@@ -250,17 +294,22 @@ async def _cleanup_client(uid: str):
     info = clients.pop(uid, None)
     if not info: return
     mid = info.get("mid", "")
+    sess_status = "N/A"
     if mid and mid in sessions:
         s = sessions[mid]
+        sess_status = s["status"]
         s["connected"].discard(uid)
         s["weapon_selected"].discard(uid)
         p = s["players"].get(uid)
         if p: p["disconnected"] = True
         if s["status"] == "in_game":
             await broadcast(mid, {"t": "l", "u": uid})
-    print(f"[정리] {uid} 완료 (세션상태: {sessions[mid]['status'] if mid and mid in sessions else 'N/A'})", flush=True)
+    print(f"[정리] {uid} 완료 (세션상태: {sess_status})", flush=True)
 
 
+# ================================================================
+# 스냅샷 / 싱크
+# ================================================================
 def build_snapshot(mid: str, exclude_uid: str) -> dict:
     s    = sessions.get(mid, {})
     snap = {}
@@ -311,6 +360,9 @@ async def sync_loop(mid: str):
     _last_broadcast.pop(mid, None)
 
 
+# ================================================================
+# KO / 전투
+# ================================================================
 async def ko_timer(mid: str, uid: str):
     await asyncio.sleep(KO_REVIVE_TIME)
     if mid not in sessions: return
@@ -371,6 +423,9 @@ async def process_rescue(mid: str, rescuer_uid: str, target_uid: str):
                            "penalty": False, "auto": False, "rescuer": rescuer_uid})
 
 
+# ================================================================
+# 매칭
+# ================================================================
 _ai_fill_tasks: dict = {}
 
 async def ai_fill_later(uid: str):
@@ -460,7 +515,7 @@ async def create_match(ta, tb):
                   for uid in ai_uids}
     print(f"[Match] {mid} RED:{a_uids} BLUE:{b_uids}", flush=True)
 
-    # ★ Redis 실패해도 메모리만으로 계속 진행
+    # Redis 실패해도 메모리만으로 계속 진행
     redis_ok = await redis_set(f"s:{mid}", {"mid": mid, "status": "loading",
                                              "team_red": a_uids, "team_blue": b_uids,
                                              "map_id": sel_map, "created_at": int(time.time())})
@@ -554,9 +609,13 @@ async def check_all_weapons_selected(mid):
         rd["status"] = "in_game"
         await redis_set(f"s:{mid}", rd)
     asyncio.create_task(sync_loop(mid))
-    asyncio.create_task(run_ai_loop(mid, sessions, broadcast, ko_timer))
+    # ★ AI_TICK_RATE를 인자로 전달
+    asyncio.create_task(run_ai_loop(mid, sessions, broadcast, ko_timer, AI_TICK_RATE))
 
 
+# ================================================================
+# WebSocket 엔드포인트
+# ================================================================
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -694,6 +753,9 @@ async def websocket_endpoint(ws: WebSocket):
         print(f"[WS] 해제: {uid}", flush=True)
 
 
+# ================================================================
+# 헬스체크
+# ================================================================
 @app.get("/")
 async def health():
     return {
