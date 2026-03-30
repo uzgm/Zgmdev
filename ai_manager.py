@@ -8,7 +8,6 @@ import asyncio, math, random, time
 # ── 공유 상수 (server.py의 constants와 동일해야 함)
 AI_MOVE_SPEED    = 3.5
 AI_ATK_COOLDOWN  = 1.2
-AI_TICK_RATE     = 3
 RESCUE_WINDOW    = 10.0
 KO_REVIVE_TIME   = 20.0
 
@@ -214,16 +213,16 @@ def ai_move_tick(p: dict, role: str,
                        zone_threat_enemy, engage_range, spd, ai_team, players)
 
 # ================================================================
-# AI 틱 루프 (server.py에서 asyncio.create_task로 실행)
+# AI 틱 루프
+# ★ tick_rate 파라미터 추가 — server.py의 AI_TICK_RATE를 받아 sync_loop와 주기 일치
 # ================================================================
-async def run_ai_loop(mid: str, sessions: dict, broadcast_fn, ko_timer_fn):
+async def run_ai_loop(mid: str, sessions: dict, broadcast_fn, ko_timer_fn,
+                      tick_rate: int = 10):
     """
-    sessions: server.py의 sessions dict 참조
-    broadcast_fn: async def broadcast(mid, msg)
-    ko_timer_fn:  async def ko_timer(mid, uid)
+    tick_rate: server.py에서 주입 (기본 10Hz, sync_loop와 맞춤)
     """
-    interval = 1.0 / AI_TICK_RATE
-    print(f"[AI] {mid} 루프 시작", flush=True)
+    interval = 1.0 / tick_rate
+    print(f"[AI] {mid} 루프 시작 (tick_rate={tick_rate}Hz)", flush=True)
 
     while mid in sessions and sessions[mid]["status"] == "in_game":
         s       = sessions[mid]
