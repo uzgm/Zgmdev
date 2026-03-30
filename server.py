@@ -258,7 +258,7 @@ async def _cleanup_client(uid: str):
         if p: p["disconnected"] = True
         if s["status"] == "in_game":
             await broadcast(mid, {"t": "l", "u": uid})
-    print(f"[정리] {uid} 완료", flush=True)
+    print(f"[정리] {uid} 완료 (세션상태: {sessions[mid]['status'] if mid and mid in sessions else 'N/A'})", flush=True)
 
 
 def build_snapshot(mid: str, exclude_uid: str) -> dict:
@@ -459,11 +459,13 @@ async def create_match(ta, tb):
     ai_weapons = {uid: {"weapon": (w:=random.choice(WEAPONS)), **WEAPON_STATS[w]}
                   for uid in ai_uids}
     print(f"[Match] {mid} RED:{a_uids} BLUE:{b_uids}", flush=True)
-    if not await redis_set(f"s:{mid}", {"mid": mid, "status": "loading",
-                                         "team_red": a_uids, "team_blue": b_uids,
-                                         "map_id": sel_map, "created_at": int(time.time())}):
-        print(f"[Match] Redis 저장 실패 → 매치 취소", flush=True)
-        return
+
+    # ★ Redis 실패해도 메모리만으로 계속 진행
+    redis_ok = await redis_set(f"s:{mid}", {"mid": mid, "status": "loading",
+                                             "team_red": a_uids, "team_blue": b_uids,
+                                             "map_id": sel_map, "created_at": int(time.time())})
+    print(f"[Match] Redis 저장: {'성공' if redis_ok else '실패 → 메모리로 계속'}", flush=True)
+
     for p in ta: await rtdb_patch(f"match_queue/parties/{p['id']}",
                                    {"match_id": mid, "assigned_team": "r", "status": "matched"})
     for p in tb: await rtdb_patch(f"match_queue/parties/{p['id']}",
@@ -507,7 +509,11 @@ async def create_match(ta, tb):
 
 async def watch_timeout(mid):
     await asyncio.sleep(JOIN_TIMEOUT)
-    if mid not in sessions or sessions[mid]["status"] == "in_game": return
+    if mid not in sessions or sessions[mid]["status"] == "in_game":
+        print(f"[Timeout] {mid} 스킵 (세션 없음 또는 이미 in_game)", flush=True)
+        return
+    print(f"[Timeout] {mid} JOIN_TIMEOUT({JOIN_TIMEOUT}s) 초과 → 정리 "
+          f"(connected={sessions[mid]['connected']} expected={sessions[mid]['expected']})", flush=True)
     await broadcast(mid, {"t": "s", "r": "timeout"})
     await cancel_session(mid)
 
