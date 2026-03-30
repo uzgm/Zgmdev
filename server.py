@@ -26,8 +26,8 @@ TEAM_SIZE      = 4
 SESSION_TTL    = 300
 JOIN_TIMEOUT   = 30.0
 AI_FILL_DELAY  = 10.0
-SYNC_TICK_RATE = 10   # 클라이언트 sync 주기 (Hz)
-AI_TICK_RATE   = 10   # ★ AI도 동일하게 맞춤 (끊김 방지)
+SYNC_TICK_RATE = 10
+AI_TICK_RATE   = 10
 MAX_MOVE_SPEED = 6.5
 KO_REVIVE_TIME = 20.0
 RESCUE_WINDOW  = 10.0
@@ -199,7 +199,6 @@ async def cleanup_stale_rtdb():
         removed = 0
         for pid, pp in data.items():
             status = pp.get("status", "")
-            # ai_party 또는 matched 상태는 이전 서버 잔여 → 삭제
             if pid.startswith("ai_party_") or status == "matched":
                 await rtdb_delete(f"match_queue/parties/{pid}")
                 removed += 1
@@ -209,7 +208,6 @@ async def cleanup_stale_rtdb():
                 removed += 1
                 print(f"[Startup] 파티 제거(unknown): {pid} (status={status})", flush=True)
         print(f"[Startup] 파티 {removed}개 제거 완료", flush=True)
-    # active_matches는 메모리가 초기화됐으니 전부 삭제
     await rtdb_delete("active_matches")
     print("[Startup] active_matches 초기화 완료", flush=True)
 
@@ -219,7 +217,7 @@ async def lifespan(app: FastAPI):
     global _http_client
     if _USE_HTTPX:
         _http_client = httpx.AsyncClient(timeout=5.0)
-    await cleanup_stale_rtdb()  # ★ 시작 시 정리
+    await cleanup_stale_rtdb()
     yield
     if _http_client:
         await _http_client.aclose()
@@ -431,17 +429,25 @@ _ai_fill_tasks: dict = {}
 async def ai_fill_later(uid: str):
     _ai_fill_tasks[uid] = True
     await asyncio.sleep(AI_FILL_DELAY)
-    already = any(uid in s["expected"] and s["status"] != "loading"
+
+    # ★ FIX: == "in_game"으로 좁혀야 loading 세션에 묶여서 early return되는 걸 방지
+    already = any(uid in s["expected"] and s["status"] == "in_game"
                   for s in sessions.values())
-    if already: _ai_fill_tasks.pop(uid, None); return
+    if already:
+        _ai_fill_tasks.pop(uid, None)
+        return
+
     data = await rtdb_get("match_queue/parties")
     if not data: _ai_fill_tasks.pop(uid, None); return
+
     user_party = user_pid = None
     for pid, pp in data.items():
         if pp.get("status") != "searching": continue
         if uid in pp.get("members", {}):
             user_party = pp; user_pid = pid; break
+
     if not user_party: _ai_fill_tasks.pop(uid, None); return
+
     members    = user_party.get("members", {}); real_count = len(members)
     ta         = [{"id": user_pid, "size": real_count, "members": dict(members)}]
     ai_members = {f"ai_{i+1}": {"nickname": f"BOT_{i+1}", "tag": "AI", "is_bot": True}
@@ -515,7 +521,6 @@ async def create_match(ta, tb):
                   for uid in ai_uids}
     print(f"[Match] {mid} RED:{a_uids} BLUE:{b_uids}", flush=True)
 
-    # Redis 실패해도 메모리만으로 계속 진행
     redis_ok = await redis_set(f"s:{mid}", {"mid": mid, "status": "loading",
                                              "team_red": a_uids, "team_blue": b_uids,
                                              "map_id": sel_map, "created_at": int(time.time())})
@@ -581,10 +586,11 @@ async def cancel_session(mid):
         if pid.startswith("ai_party_"):
             await rtdb_delete(f"match_queue/parties/{pid}")
         else:
+            # ★ FIX: idle → searching으로 복원해야 재매칭 시 try_match()가 파티를 찾을 수 있음
             await rtdb_patch(f"match_queue/parties/{pid}", {
                 "match_id":      "",
                 "assigned_team": "",
-                "status":        "idle"
+                "status":        "searching"
             })
     print(f"[Session] {mid} 완전 정리", flush=True)
 
@@ -609,7 +615,6 @@ async def check_all_weapons_selected(mid):
         rd["status"] = "in_game"
         await redis_set(f"s:{mid}", rd)
     asyncio.create_task(sync_loop(mid))
-    # ★ AI_TICK_RATE를 인자로 전달
     asyncio.create_task(run_ai_loop(mid, sessions, broadcast, ko_timer, AI_TICK_RATE))
 
 
