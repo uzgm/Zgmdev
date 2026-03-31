@@ -635,7 +635,32 @@ async def websocket_endpoint(ws: WebSocket):
 
             if t == "q":
                 uid = msg.get("u", "")
-                print(f"[q] 매칭 요청: {uid}", flush=True)
+                pid = msg.get("pid", "")
+                print(f"[q] 매칭 요청: uid={uid} pid={pid}", flush=True)
+
+                # ★ FIX: disbanded/matched 등 잔여 상태를 searching으로 강제 리셋
+                # 클라이언트가 pid를 보내면 즉시 처리, 없으면 전체 순회해서 uid 포함된 파티 찾아서 리셋
+                if pid:
+                    await rtdb_patch(f"match_queue/parties/{pid}", {
+                        "status":        "searching",
+                        "match_id":      "",
+                        "assigned_team": ""
+                    })
+                    print(f"[q] 파티 {pid} → searching 리셋", flush=True)
+                else:
+                    # pid 없으면 RTDB 순회해서 uid 포함된 파티 찾아 리셋
+                    all_parties = await rtdb_get("match_queue/parties")
+                    if all_parties and isinstance(all_parties, dict):
+                        for fpid, fp in all_parties.items():
+                            if uid in fp.get("members", {}) and not fpid.startswith("ai_party_"):
+                                await rtdb_patch(f"match_queue/parties/{fpid}", {
+                                    "status":        "searching",
+                                    "match_id":      "",
+                                    "assigned_team": ""
+                                })
+                                print(f"[q] 파티 {fpid} → searching 리셋 (pid 없이 순회)", flush=True)
+                                break
+
                 asyncio.create_task(trigger_match())
                 asyncio.create_task(ai_fill_later(uid))
                 await ws.send_text(json.dumps({"t": "w"}))
