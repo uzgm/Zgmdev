@@ -456,29 +456,6 @@ async def process_rescue(mid: str, rescuer_uid: str, target_uid: str):
 # ================================================================
 # 매칭
 # ================================================================
-_ai_fill_tasks: dict = {}
-
-async def ai_fill_later(uid: str):
-    """trigger_match에서 즉시 처리되므로, 이 함수는 10초 후 백업 역할만 함"""
-    _ai_fill_tasks[uid] = True
-    await asyncio.sleep(AI_FILL_DELAY)
-
-    # 이미 세션(loading 또는 in_game)에 들어가 있으면 스킵
-    already = any(
-        uid in s["expected"]
-        for s in sessions.values()
-    )
-    if already:
-        print(f"[AI Fill Backup] {uid} 이미 세션 있음 → 스킵", flush=True)
-        _ai_fill_tasks.pop(uid, None)
-        return
-
-    # 아직도 매치가 안 됐다면 한 번 더 시도
-    print(f"[AI Fill Backup] {uid} 10초 후에도 미매칭 → 재시도", flush=True)
-    data = await rtdb_get("match_queue/parties")
-    if data and isinstance(data, dict):
-        await _try_ai_fill_now(data)
-    _ai_fill_tasks.pop(uid, None)
 
 def find_combo(parties, target, current):
     total = sum(p["size"] for p in current)
@@ -518,31 +495,50 @@ def try_match(parties):
 
 def get_uids(parties): return [uid for p in parties for uid in p["members"]]
 
+REAL_PLAYER_WAIT = 10.0  # 실제 플레이어 대기 시간(초)
+
 async def trigger_match():
     global _trigger_match_running
     if _trigger_match_running: return
     _trigger_match_running = True
     try:
+        # ── 1단계: 0.5초 후 실제 플레이어끼리 즉시 매칭 시도 ─────────
         await asyncio.sleep(0.5)
-
-        # 매칭 시도 전에 좀비 파티 정리
         await cleanup_stale_parties("[PreMatch]")
 
         async with match_lock:
             data = await rtdb_get("match_queue/parties")
-            party_count = len(data) if data else 0
-            print(f"[trigger_match] RTDB data type={type(data)} count={party_count}", flush=True)
             if not data or not isinstance(data, dict): return
+            party_count = len(data)
+            print(f"[trigger_match] count={party_count}", flush=True)
 
             ta, tb = try_match(data)
-            ta_ids = [p['id'] for p in ta] if ta else None
-            tb_ids = [p['id'] for p in tb] if tb else None
-            print(f"[trigger_match] ta={ta_ids} tb={tb_ids}", flush=True)
-
             if ta and tb:
+                print(f"[trigger_match] 실제 플레이어 즉시 매칭 성공", flush=True)
                 await create_match(ta, tb)
-            else:
-                # 실제 파티만 있고 AI 상대가 없으면 즉시 AI 매치 생성
+                return
+
+            print(f"[trigger_match] 실매치 실패 → {REAL_PLAYER_WAIT}초 대기", flush=True)
+
+        # ── 2단계: REAL_PLAYER_WAIT 초 동안 1초마다 재시도 ───────────
+        deadline = time.time() + REAL_PLAYER_WAIT
+        while time.time() < deadline:
+            await asyncio.sleep(1.0)
+            # 이미 다른 경로로 세션이 생겼으면 중단
+            async with match_lock:
+                data = await rtdb_get("match_queue/parties")
+                if not data or not isinstance(data, dict): return
+                ta, tb = try_match(data)
+                if ta and tb:
+                    print(f"[trigger_match] 대기 중 실제 플레이어 매칭 성공", flush=True)
+                    await create_match(ta, tb)
+                    return
+
+        # ── 3단계: 대기 만료 → AI로 채우기 ──────────────────────────
+        print(f"[trigger_match] {REAL_PLAYER_WAIT}초 만료 → AI 매치 생성", flush=True)
+        async with match_lock:
+            data = await rtdb_get("match_queue/parties")
+            if data and isinstance(data, dict):
                 await _try_ai_fill_now(data)
     finally:
         _trigger_match_running = False
@@ -734,7 +730,6 @@ async def websocket_endpoint(ws: WebSocket):
                                 break
 
                 asyncio.create_task(trigger_match())
-                asyncio.create_task(ai_fill_later(uid))
                 await ws.send_text(json.dumps({"t": "w"}))
 
             elif t == "j":
