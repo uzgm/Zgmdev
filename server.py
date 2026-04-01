@@ -459,47 +459,25 @@ async def process_rescue(mid: str, rescuer_uid: str, target_uid: str):
 _ai_fill_tasks: dict = {}
 
 async def ai_fill_later(uid: str):
+    """trigger_match에서 즉시 처리되므로, 이 함수는 10초 후 백업 역할만 함"""
     _ai_fill_tasks[uid] = True
     await asyncio.sleep(AI_FILL_DELAY)
 
-    # 이미 in_game 세션에 있으면 스킵 (loading 상태는 스킵 안 함)
+    # 이미 세션(loading 또는 in_game)에 들어가 있으면 스킵
     already = any(
-        uid in s["expected"] and s["status"] == "in_game"
+        uid in s["expected"]
         for s in sessions.values()
     )
     if already:
-        print(f"[AI Fill] {uid} 이미 in_game 세션 있음 → 스킵", flush=True)
+        print(f"[AI Fill Backup] {uid} 이미 세션 있음 → 스킵", flush=True)
         _ai_fill_tasks.pop(uid, None)
         return
 
+    # 아직도 매치가 안 됐다면 한 번 더 시도
+    print(f"[AI Fill Backup] {uid} 10초 후에도 미매칭 → 재시도", flush=True)
     data = await rtdb_get("match_queue/parties")
-    if not data:
-        _ai_fill_tasks.pop(uid, None)
-        return
-
-    user_party = user_pid = None
-    for pid, pp in data.items():
-        if pp.get("status") != "searching": continue
-        if uid in pp.get("members", {}):
-            user_party = pp; user_pid = pid; break
-
-    if not user_party:
-        print(f"[AI Fill] {uid} searching 파티 못 찾음 → 스킵", flush=True)
-        _ai_fill_tasks.pop(uid, None)
-        return
-
-    members    = user_party.get("members", {}); real_count = len(members)
-    ta         = [{"id": user_pid, "size": real_count, "members": dict(members)}]
-    ai_members = {f"ai_{i+1}": {"nickname": f"BOT_{i+1}", "tag": "AI", "is_bot": True}
-                  for i in range(TEAM_SIZE)}
-    ai_pid = f"ai_party_{int(time.time())}"
-    tb = [{"id": ai_pid, "size": TEAM_SIZE, "members": ai_members}]
-    if real_count < TEAM_SIZE:
-        for i in range(TEAM_SIZE - real_count):
-            ta[0]["members"][f"ai_fill_{i+1}"] = {"nickname": f"BOT_A{i+1}", "tag": "AI", "is_bot": True}
-        ta[0]["size"] = TEAM_SIZE
-    print(f"[AI Fill] {uid} AI 매칭 생성", flush=True)
-    await create_match(ta, tb)
+    if data and isinstance(data, dict):
+        await _try_ai_fill_now(data)
     _ai_fill_tasks.pop(uid, None)
 
 def find_combo(parties, target, current):
@@ -547,7 +525,7 @@ async def trigger_match():
     try:
         await asyncio.sleep(0.5)
 
-        # ★ 매칭 시도 전에 좀비 파티 정리
+        # 매칭 시도 전에 좀비 파티 정리
         await cleanup_stale_parties("[PreMatch]")
 
         async with match_lock:
@@ -555,13 +533,50 @@ async def trigger_match():
             party_count = len(data) if data else 0
             print(f"[trigger_match] RTDB data type={type(data)} count={party_count}", flush=True)
             if not data or not isinstance(data, dict): return
+
             ta, tb = try_match(data)
             ta_ids = [p['id'] for p in ta] if ta else None
             tb_ids = [p['id'] for p in tb] if tb else None
             print(f"[trigger_match] ta={ta_ids} tb={tb_ids}", flush=True)
-            if ta: await create_match(ta, tb)
+
+            if ta and tb:
+                await create_match(ta, tb)
+            else:
+                # 실제 파티만 있고 AI 상대가 없으면 즉시 AI 매치 생성
+                await _try_ai_fill_now(data)
     finally:
         _trigger_match_running = False
+
+
+async def _try_ai_fill_now(data: dict):
+    """실제 유저 파티가 searching 상태일 때 즉시 AI 파티를 붙여 매치 생성"""
+    for pid, pp in data.items():
+        if pp.get("status") != "searching": continue
+        if pid.startswith("ai_party_"): continue
+        members = pp.get("members", {})
+        if not members: continue
+
+        real_count = len(members)
+        ta = [{"id": pid, "size": real_count, "members": dict(members)}]
+
+        # 부족한 자리 AI로 채우기
+        if real_count < TEAM_SIZE:
+            for i in range(TEAM_SIZE - real_count):
+                ta[0]["members"][f"ai_fill_{i+1}"] = {
+                    "nickname": f"BOT_A{i+1}", "tag": "AI", "is_bot": True
+                }
+            ta[0]["size"] = TEAM_SIZE
+
+        ai_pid = f"ai_party_{int(time.time())}"
+        ai_members = {
+            f"ai_{i+1}": {"nickname": f"BOT_{i+1}", "tag": "AI", "is_bot": True}
+            for i in range(TEAM_SIZE)
+        }
+        tb = [{"id": ai_pid, "size": TEAM_SIZE, "members": ai_members}]
+
+        print(f"[AI Fill Now] 즉시 AI 매치 생성: party={pid} real={real_count}", flush=True)
+        await create_match(ta, tb)
+        return  # 첫 번째 파티만 처리
 
 async def create_match(ta, tb):
     mid    = f"m{int(time.time()*1000)}"
