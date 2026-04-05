@@ -31,9 +31,8 @@ MAX_MOVE_SPEED = 6.5
 KO_REVIVE_TIME = 20.0
 RESCUE_WINDOW  = 10.0
 
-# ── 매치메이킹 워커 설정 ──────────────────────────────────────────
-WORKER_TICK     = 1.0   # 워커가 큐를 스캔하는 주기(초)
-AI_FILL_AFTER   = 10.0  # 이 시간(초) 이상 기다린 티켓은 AI로 채움
+WORKER_TICK  = 1.0   # 워커 스캔 주기(초)
+AI_FILL_AFTER = 10.0  # 이 시간(초) 초과 시 AI로 채움
 
 MAP_MIN_X = -16.0; MAP_MAX_X = 16.0
 MAP_MIN_Z = -9.0;  MAP_MAX_Z = 9.0
@@ -51,8 +50,7 @@ print(f"=== REDIS_URL: {REDIS_URL[:30] if REDIS_URL else '없음'} ===", flush=T
 clients: dict  = {}
 sessions: dict = {}
 
-# ── 티켓 저장소 (메모리 내) ──────────────────────────────────────
-# { pid: { "pid": str, "members": dict, "size": int, "joined_at": float } }
+# 티켓: { pid: { "pid", "members", "size", "joined_at" } }
 _tickets: dict = {}
 _tickets_lock  = asyncio.Lock()
 
@@ -80,14 +78,12 @@ async def _put(url: str, data) -> bool:
     try:
         body = json.dumps(data)
         if _USE_HTTPX and _http_client:
-            r = await _http_client.put(url, content=body,
-                                       headers={"Content-Type": "application/json"})
+            r = await _http_client.put(url, content=body, headers={"Content-Type": "application/json"})
             return r.status_code == 200
         else:
             import urllib.request as ur
             loop = asyncio.get_event_loop()
-            req  = ur.Request(url, data=body.encode(),
-                              headers={"Content-Type": "application/json"}, method="PUT")
+            req  = ur.Request(url, data=body.encode(), headers={"Content-Type": "application/json"}, method="PUT")
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
             return True
     except Exception as e:
@@ -98,14 +94,12 @@ async def _patch(url: str, data) -> bool:
     try:
         body = json.dumps(data)
         if _USE_HTTPX and _http_client:
-            r = await _http_client.patch(url, content=body,
-                                         headers={"Content-Type": "application/json"})
+            r = await _http_client.patch(url, content=body, headers={"Content-Type": "application/json"})
             return r.status_code == 200
         else:
             import urllib.request as ur
             loop = asyncio.get_event_loop()
-            req  = ur.Request(url, data=body.encode(),
-                              headers={"Content-Type": "application/json"}, method="PATCH")
+            req  = ur.Request(url, data=body.encode(), headers={"Content-Type": "application/json"}, method="PATCH")
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
             return True
     except Exception as e:
@@ -140,8 +134,7 @@ async def redis_set(key, value, ex=SESSION_TTL) -> bool:
         else:
             import urllib.request as ur
             loop = asyncio.get_event_loop()
-            req  = ur.Request(REDIS_URL, data=body.encode(),
-                              headers=_redis_headers(), method="POST")
+            req  = ur.Request(REDIS_URL, data=body.encode(), headers=_redis_headers(), method="POST")
             raw  = await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5).read())
             return json.loads(raw).get("result") == "OK"
     except Exception as e:
@@ -157,10 +150,8 @@ async def redis_get(key):
         else:
             import urllib.request as ur
             loop = asyncio.get_event_loop()
-            req  = ur.Request(REDIS_URL, data=body.encode(),
-                              headers=_redis_headers(), method="POST")
-            data = await loop.run_in_executor(None,
-                lambda: json.loads(ur.urlopen(req, timeout=5).read()))
+            req  = ur.Request(REDIS_URL, data=body.encode(), headers=_redis_headers(), method="POST")
+            data = await loop.run_in_executor(None, lambda: json.loads(ur.urlopen(req, timeout=5).read()))
             raw  = data.get("result")
         return json.loads(raw) if raw else None
     except Exception as e:
@@ -175,8 +166,7 @@ async def redis_del(key):
         else:
             import urllib.request as ur
             loop = asyncio.get_event_loop()
-            req  = ur.Request(REDIS_URL, data=body.encode(),
-                              headers=_redis_headers(), method="POST")
+            req  = ur.Request(REDIS_URL, data=body.encode(), headers=_redis_headers(), method="POST")
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
     except Exception as e:
         print(f"[Redis DEL 오류] {type(e).__name__}: {e}", flush=True)
@@ -201,42 +191,22 @@ async def cleanup_stale_rtdb():
     data = await rtdb_get("match_queue/parties")
     if data and isinstance(data, dict):
         for pid, pp in data.items():
-            # AI 파티 제거
             if pid.startswith("ai_party_"):
                 await rtdb_delete(f"match_queue/parties/{pid}")
                 continue
-            # matched/loading 상태 파티를 searching 으로 복원
             status = pp.get("status", "")
             if status in ("matched", "loading", "in_game"):
                 await rtdb_patch(f"match_queue/parties/{pid}", {
-                    "status": "searching",
-                    "match_id": "",
-                    "assigned_team": ""
+                    "status": "searching", "match_id": "", "assigned_team": ""
                 })
     await rtdb_delete("active_matches")
     print("[Startup] 정리 완료", flush=True)
 
 
 # ================================================================
-# ★★★ 티켓 기반 매치메이킹 워커 ★★★
-#
-# 실제 프로덕션 방식:
-#   1. 클라이언트는 "큐 신청" 티켓만 제출하고 끝 (fire-and-forget)
-#   2. 별도 워커가 독립적으로 WORKER_TICK 마다 큐를 스캔
-#   3. 워커는 조합 가능한 티켓을 찾아 매치 생성
-#   4. AI_FILL_AFTER 초 이상 기다린 티켓은 AI로 채움
-#
-# 이 방식의 장점:
-#   - 큐 신청 시점과 매칭 로직이 완전히 분리됨 (race condition 없음)
-#   - _trigger_match_running 같은 글로벌 플래그 불필요
-#   - 새 파티가 들어와도 워커가 다음 틱에 자동으로 감지
+# 매치메이킹 워커
 # ================================================================
 async def matchmaking_worker():
-    """
-    프로덕션 매치메이킹 서비스의 핵심 패턴:
-    "독립 워커가 주기적으로 티켓 풀을 스캔해서 매치를 생성한다"
-    (Valve, Riot, Blizzard 모두 이 방식의 변형을 사용)
-    """
     print("[Worker] 매치메이킹 워커 시작", flush=True)
     while True:
         try:
@@ -251,91 +221,162 @@ async def _worker_tick():
         if not _tickets:
             return
 
-        now = time.time()
+        now     = time.time()
         tickets = list(_tickets.values())
+        total_real = sum(t["size"] for t in tickets)
 
-        print(f"[Worker] 틱 — 티켓 {len(tickets)}개: {[t['pid'] for t in tickets]}", flush=True)
+        print(f"[Worker] 틱 — 티켓 {len(tickets)}개 "
+              f"{[(t['pid'], t['size']) for t in tickets]} "
+              f"총인원={total_real}", flush=True)
 
-        # ── 1단계: 실제 플레이어끼리 팀 조합 시도 ─────────────────
-        ta, tb = _find_match(tickets)
-        if ta and tb:
-            print(f"[Worker] 실 플레이어 매칭 성공 "
-                  f"RED={[t['pid'] for t in ta]} BLUE={[t['pid'] for t in tb]}", flush=True)
-            for t in ta + tb:
+        # ── 1단계: 실제 플레이어 8명 이상이면 8명끼리 4v4 매치 ────
+        if total_real >= TEAM_SIZE * 2:
+            ta_tickets, tb_tickets = _split_into_two_teams(tickets)
+            if ta_tickets and tb_tickets:
+                for t in ta_tickets + tb_tickets:
+                    _tickets.pop(t["pid"], None)
+                print(f"[Worker] 풀 매치 성공 "
+                      f"RED={[t['pid'] for t in ta_tickets]} "
+                      f"BLUE={[t['pid'] for t in tb_tickets]}", flush=True)
+                asyncio.create_task(create_match(ta_tickets, tb_tickets))
+                return
+
+        # ── 2단계: 4명 이상이면 RED팀 구성 후 AI BLUE ────────────
+        if total_real >= TEAM_SIZE:
+            ta_tickets, remaining = _take_up_to(tickets, TEAM_SIZE)
+            for t in ta_tickets:
                 _tickets.pop(t["pid"], None)
-            asyncio.create_task(create_match(ta, tb))
+            print(f"[Worker] 반 매치(RED실제+BLUE AI) "
+                  f"RED={[t['pid'] for t in ta_tickets]}", flush=True)
+            asyncio.create_task(_create_match_with_ai_blue(ta_tickets))
             return
 
-        # ── 2단계: AI_FILL_AFTER 초 이상 기다린 티켓이 있으면 AI 채움 ──
-        old_tickets = [t for t in tickets if now - t["joined_at"] >= AI_FILL_AFTER]
-        if not old_tickets:
-            return
+        # ── 3단계: AI_FILL_AFTER 초 초과 티켓이 있으면 →
+        #           전체 실제 플레이어를 한 팀으로 합치고 AI 채움 ──
+        oldest_time = min(t["joined_at"] for t in tickets)
+        if now - oldest_time < AI_FILL_AFTER:
+            return  # 아직 기다리는 중
 
-        ticket = old_tickets[0]  # 가장 오래 기다린 파티 1개 처리
-        _tickets.pop(ticket["pid"], None)
+        # 모든 티켓의 members를 하나로 합침 (최대 TEAM_SIZE까지)
+        merged_members = {}
+        pids_used = []
+        for t in sorted(tickets, key=lambda x: x["joined_at"]):
+            for uid, info in t["members"].items():
+                if len(merged_members) >= TEAM_SIZE:
+                    break
+                merged_members[uid] = info
+            pids_used.append(t["pid"])
+            if len(merged_members) >= TEAM_SIZE:
+                break
 
-        real_count = ticket["size"]
-        ta = [ticket.copy()]
+        real_count = len(merged_members)
 
-        # 빈 자리 AI로 채움
+        # RED팀: 실제 플레이어 + 부족분 AI_FILL
         if real_count < TEAM_SIZE:
-            extra = {
-                f"ai_fill_{i+1}": {"nickname": f"BOT_A{i+1}", "tag": "AI", "is_bot": True}
-                for i in range(TEAM_SIZE - real_count)
-            }
-            ta[0]["members"] = {**ticket["members"], **extra}
-            ta[0]["size"] = TEAM_SIZE
+            for i in range(TEAM_SIZE - real_count):
+                merged_members[f"ai_fill_{i+1}"] = {
+                    "nickname": f"BOT_A{i+1}", "tag": "AI", "is_bot": True
+                }
 
+        # BLUE팀: 전원 AI
         ai_pid = f"ai_party_{int(time.time())}"
         ai_members = {
             f"ai_{i+1}": {"nickname": f"BOT_{i+1}", "tag": "AI", "is_bot": True}
             for i in range(TEAM_SIZE)
         }
-        tb = [{"pid": ai_pid, "members": ai_members, "size": TEAM_SIZE,
-               "joined_at": now}]
 
-        print(f"[Worker] AI 채움 — party={ticket['pid']} real={real_count}", flush=True)
+        ta = [{"pid": pids_used[0], "members": merged_members,
+               "size": TEAM_SIZE, "joined_at": oldest_time}]
+        tb = [{"pid": ai_pid, "members": ai_members,
+               "size": TEAM_SIZE, "joined_at": now}]
+
+        # 사용한 티켓 전부 제거
+        for pid in pids_used:
+            _tickets.pop(pid, None)
+
+        print(f"[Worker] AI 채움 — real={real_count} pids={pids_used}", flush=True)
         asyncio.create_task(create_match(ta, tb))
 
 
-def _find_match(tickets: list):
+def _split_into_two_teams(tickets: list):
     """
-    현재 티켓 풀에서 두 팀(각 TEAM_SIZE)을 구성할 수 있는 조합을 찾는다.
-    간단한 조합 탐색 — 대규모 서비스는 여기에 MMR/지역 필터를 추가한다.
+    티켓 리스트에서 두 팀(각 TEAM_SIZE)을 구성.
+    joined_at 순으로 앞에서부터 채움.
     """
-    def combo(pool, target, current):
-        total = sum(t["size"] for t in current)
-        if total == target:
-            return current[:]
-        if total > target:
-            return []
-        start = 0
-        if current:
-            for i, t in enumerate(pool):
-                if t["pid"] == current[-1]["pid"]:
-                    start = i + 1
-                    break
-        for i in range(start, len(pool)):
-            if total + pool[i]["size"] <= target:
-                r = combo(pool, target, current + [pool[i]])
-                if r:
-                    return r
-        return []
+    sorted_t = sorted(tickets, key=lambda x: x["joined_at"])
 
-    ta = combo(tickets, TEAM_SIZE, [])
-    if not ta:
-        return None, None
-    used = {t["pid"] for t in ta}
-    remaining = [t for t in tickets if t["pid"] not in used]
-    tb = combo(remaining, TEAM_SIZE, [])
-    return (ta, tb) if tb else (None, None)
+    team_a_members, team_b_members = {}, {}
+    team_a_tickets, team_b_tickets = [], []
+    team_a_pids, team_b_pids = set(), set()
+
+    for t in sorted_t:
+        for uid, info in t["members"].items():
+            if len(team_a_members) < TEAM_SIZE:
+                team_a_members[uid] = info
+                if t["pid"] not in team_a_pids:
+                    team_a_pids.add(t["pid"])
+                    team_a_tickets.append(t)
+            elif len(team_b_members) < TEAM_SIZE:
+                team_b_members[uid] = info
+                if t["pid"] not in team_b_pids:
+                    team_b_pids.add(t["pid"])
+                    team_b_tickets.append(t)
+
+    if len(team_a_members) == TEAM_SIZE and len(team_b_members) == TEAM_SIZE:
+        # 각 티켓의 members를 분할된 것으로 교체
+        ta = [{"pid": t["pid"],
+               "members": {uid: team_a_members[uid]
+                           for uid in t["members"] if uid in team_a_members},
+               "size": sum(1 for uid in t["members"] if uid in team_a_members),
+               "joined_at": t["joined_at"]}
+              for t in team_a_tickets]
+        tb = [{"pid": t["pid"],
+               "members": {uid: team_b_members[uid]
+                           for uid in t["members"] if uid in team_b_members},
+               "size": sum(1 for uid in t["members"] if uid in team_b_members),
+               "joined_at": t["joined_at"]}
+              for t in team_b_tickets]
+        return ta, tb
+
+    return None, None
+
+
+def _take_up_to(tickets: list, n: int):
+    """
+    joined_at 순으로 최대 n명을 채울 티켓들과 나머지를 반환.
+    """
+    sorted_t  = sorted(tickets, key=lambda x: x["joined_at"])
+    taken     = []
+    remaining = []
+    count     = 0
+    for t in sorted_t:
+        if count < n:
+            take = min(t["size"], n - count)
+            taken.append({"pid": t["pid"],
+                          "members": dict(list(t["members"].items())[:take]),
+                          "size": take,
+                          "joined_at": t["joined_at"]})
+            count += take
+        else:
+            remaining.append(t)
+    return taken, remaining
+
+
+async def _create_match_with_ai_blue(ta_tickets: list):
+    """RED팀은 실제 플레이어, BLUE팀은 전원 AI"""
+    ai_pid = f"ai_party_{int(time.time())}"
+    tb = [{"pid": ai_pid,
+           "members": {f"ai_{i+1}": {"nickname": f"BOT_{i+1}", "tag": "AI", "is_bot": True}
+                       for i in range(TEAM_SIZE)},
+           "size": TEAM_SIZE,
+           "joined_at": time.time()}]
+    await create_match(ta_tickets, tb)
 
 
 # ================================================================
 # 티켓 등록 / 취소
 # ================================================================
 async def enqueue_ticket(pid: str, members: dict):
-    """파티가 큐에 들어올 때 티켓 등록"""
     async with _tickets_lock:
         _tickets[pid] = {
             "pid":       pid,
@@ -348,7 +389,6 @@ async def enqueue_ticket(pid: str, members: dict):
 
 
 async def dequeue_ticket(pid: str):
-    """파티가 큐를 떠날 때 티켓 제거"""
     async with _tickets_lock:
         removed = _tickets.pop(pid, None)
     if removed:
@@ -356,7 +396,7 @@ async def dequeue_ticket(pid: str):
 
 
 # ================================================================
-# @asynccontextmanager lifespan
+# lifespan
 # ================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -364,7 +404,6 @@ async def lifespan(app: FastAPI):
     if _USE_HTTPX:
         _http_client = httpx.AsyncClient(timeout=5.0)
     await cleanup_stale_rtdb()
-    # ★ 워커를 백그라운드 태스크로 시작
     worker_task = asyncio.create_task(matchmaking_worker())
     yield
     worker_task.cancel()
@@ -382,7 +421,6 @@ def dist_2d(a: dict, b: dict) -> float:
 
 def clamp_pos(x, z):
     return max(MAP_MIN_X, min(MAP_MAX_X, x)), max(MAP_MIN_Z, min(MAP_MAX_Z, z))
-
 
 def validate_move(uid: str, new_x: float, new_y: float, new_z: float):
     info = clients.get(uid)
@@ -436,7 +474,6 @@ async def send_to(uid: str, msg: dict):
     except Exception:
         await _cleanup_client(uid)
 
-
 async def _cleanup_client(uid: str):
     info = clients.pop(uid, None)
     if not info: return
@@ -473,7 +510,6 @@ def build_snapshot(mid: str, exclude_uid: str) -> dict:
             "an": p.get("an", "idle"),
         }
     return snap
-
 
 def _state_sig(p: dict) -> str:
     return (f"{round(p.get('x',0),1)},{round(p.get('z',0),1)},"
@@ -518,7 +554,6 @@ async def ko_timer(mid: str, uid: str):
     print(f"[KO] {uid} 자동 기상", flush=True)
     await broadcast(mid, {"t": "rev", "uid": uid, "hp": 30, "penalty": True, "auto": True})
 
-
 async def process_attack(mid: str, attacker_uid: str, msg: dict):
     if mid not in sessions: return
     s        = sessions[mid]
@@ -547,7 +582,6 @@ async def process_attack(mid: str, attacker_uid: str, msg: dict):
             await broadcast(mid, {"t": "ko", "uid": tid})
             asyncio.create_task(ko_timer(mid, tid))
 
-
 async def process_rescue(mid: str, rescuer_uid: str, target_uid: str):
     if mid not in sessions: return
     s       = sessions[mid]
@@ -571,18 +605,12 @@ async def process_rescue(mid: str, rescuer_uid: str, target_uid: str):
 # 매치 생성
 # ================================================================
 async def create_match(ta: list, tb: list):
-    """
-    ta, tb: 각각 팀을 구성하는 티켓 리스트
-    티켓 구조: { "pid": str, "members": dict, "size": int, "joined_at": float }
-    """
     mid    = f"m{int(time.time()*1000)}"
     a_pids = [t["pid"] for t in ta]
     b_pids = [t["pid"] for t in tb]
 
     def get_uids(team_tickets):
-        return list(dict.fromkeys(
-            uid for t in team_tickets for uid in t["members"]
-        ))
+        return list(dict.fromkeys(uid for t in team_tickets for uid in t["members"]))
 
     a_uids = get_uids(ta)
     b_uids = get_uids(tb)
@@ -600,7 +628,6 @@ async def create_match(ta: list, tb: list):
 
     print(f"[Match] {mid} RED:{a_uids} BLUE:{b_uids}", flush=True)
 
-    # Redis에 세션 정보 저장
     redis_ok = await redis_set(f"s:{mid}", {
         "mid": mid, "status": "loading",
         "team_red": a_uids, "team_blue": b_uids,
@@ -608,7 +635,6 @@ async def create_match(ta: list, tb: list):
     })
     print(f"[Match] Redis: {'성공' if redis_ok else '실패 → 메모리로 계속'}", flush=True)
 
-    # RTDB: 실제 플레이어 파티에 match_id 알림 (클라이언트가 폴링)
     for pid in a_pids:
         if not pid.startswith("ai_party_"):
             await rtdb_patch(f"match_queue/parties/{pid}",
@@ -618,7 +644,6 @@ async def create_match(ta: list, tb: list):
             await rtdb_patch(f"match_queue/parties/{pid}",
                              {"match_id": mid, "assigned_team": "b", "status": "matched"})
 
-    # AI 플레이어 초기 상태
     red_ai  = [u for u in a_uids if u.startswith("ai_")]
     blue_ai = [u for u in b_uids if u.startswith("ai_")]
     ri = bi = 0
@@ -666,7 +691,6 @@ async def watch_timeout(mid):
     await broadcast(mid, {"t": "s", "r": "timeout"})
     await cancel_session(mid)
 
-
 async def cancel_session(mid):
     if mid not in sessions: return
     s = sessions.pop(mid)
@@ -680,7 +704,6 @@ async def cancel_session(mid):
                 "match_id": "", "assigned_team": "", "status": "searching"
             })
     print(f"[Session] {mid} 완전 정리", flush=True)
-
 
 async def check_all_weapons_selected(mid):
     if mid not in sessions: return
@@ -722,39 +745,44 @@ async def websocket_endpoint(ws: WebSocket):
             t = msg.get("t", "")
 
             # ── 큐 신청 ────────────────────────────────────────────
-            # 기존: trigger_match() 직접 호출 (race condition 유발)
-            # 변경: 티켓만 등록하고 워커가 알아서 처리
             if t == "q":
-                uid = msg.get("u", "")
-                pid = msg.get("pid", "")
-                members = msg.get("members", {uid: {"nickname": uid, "tag": "PLAYER"}})
+                uid     = msg.get("u", "")
+                pid     = msg.get("pid", "")
+                # ★ 클라이언트가 members를 보내주면 그대로 사용,
+                #   없으면 RTDB에서 파티 정보를 가져옴
+                members = msg.get("members", None)
 
                 print(f"[q] 큐 신청: uid={uid} pid={pid}", flush=True)
 
-                # RTDB 파티 상태를 searching 으로 설정
-                if pid:
-                    await rtdb_patch(f"match_queue/parties/{pid}", {
-                        "status": "searching",
-                        "match_id": "",
-                        "assigned_team": ""
-                    })
-                else:
-                    # pid 없으면 uid로 파티 찾기
-                    pid = uid  # fallback: uid를 pid로 사용
+                # pid 없으면 RTDB에서 uid 포함된 파티 찾기
+                if not pid:
                     all_parties = await rtdb_get("match_queue/parties")
                     if all_parties and isinstance(all_parties, dict):
                         for fpid, fp in all_parties.items():
                             if uid in fp.get("members", {}) and not fpid.startswith("ai_party_"):
                                 pid = fpid
-                                members = fp.get("members", members)
-                                await rtdb_patch(f"match_queue/parties/{fpid}", {
-                                    "status": "searching",
-                                    "match_id": "",
-                                    "assigned_team": ""
-                                })
+                                if not members:
+                                    members = fp.get("members", {})
                                 break
+                    if not pid:
+                        pid = uid  # 최후 fallback
 
-                # ★ 티켓 등록 — 워커가 다음 틱에 자동으로 처리
+                # members가 아직 없으면 RTDB 파티에서 가져오기
+                if not members and pid:
+                    party_data = await rtdb_get(f"match_queue/parties/{pid}")
+                    if party_data and isinstance(party_data, dict):
+                        members = party_data.get("members", {})
+
+                # 그래도 없으면 uid만으로 구성
+                if not members:
+                    members = {uid: {"nickname": uid, "tag": "PLAYER"}}
+
+                # RTDB 파티 상태를 searching으로
+                if pid and not pid.startswith("ai_party_"):
+                    await rtdb_patch(f"match_queue/parties/{pid}", {
+                        "status": "searching", "match_id": "", "assigned_team": ""
+                    })
+
                 await enqueue_ticket(pid, members)
                 await ws.send_text(json.dumps({"t": "w"}))
 
@@ -763,12 +791,9 @@ async def websocket_endpoint(ws: WebSocket):
                 pid = msg.get("pid", "")
                 if pid:
                     await dequeue_ticket(pid)
-                    if pid:
-                        await rtdb_patch(f"match_queue/parties/{pid}", {
-                            "status": "idle",
-                            "match_id": "",
-                            "assigned_team": ""
-                        })
+                    await rtdb_patch(f"match_queue/parties/{pid}", {
+                        "status": "idle", "match_id": "", "assigned_team": ""
+                    })
                 await ws.send_text(json.dumps({"t": "q_cancelled"}))
 
             # ── 게임 참가 ──────────────────────────────────────────
@@ -795,8 +820,7 @@ async def websocket_endpoint(ws: WebSocket):
                 s["connected"].add(uid)
                 if uid in s["players"] and s["players"][uid].get("disconnected", False):
                     p = s["players"][uid]; p["disconnected"] = False
-                    spawn = {"x": p["x"], "y": p["y"], "z": p["z"],
-                             "ry": p["ry"], "an": "idle"}
+                    spawn = {"x": p["x"], "y": p["y"], "z": p["z"], "ry": p["ry"], "an": "idle"}
                 else:
                     if team == "r":
                         idx   = len([u for u in s["team_red"] if u in s["connected"]]) - 1
@@ -814,18 +838,18 @@ async def websocket_endpoint(ws: WebSocket):
                 cn = len(s["connected"]); ex = len(s["expected"])
                 snap = build_snapshot(mid, uid)
                 await ws.send_text(json.dumps({
-                    "t":         "js",
-                    "u":         uid,
-                    "tm":        team,
-                    "sp":        spawn,
-                    "sn":        snap,
-                    "cn":        cn,
-                    "ex":        ex,
-                    "ai_weapons":  s["weapons"],
-                    "map_id":    s.get("map_id", "default"),
-                    "reconnect": s["status"] == "in_game",
-                    "team_red":  s["team_red"],
-                    "team_blue": s["team_blue"],
+                    "t":          "js",
+                    "u":          uid,
+                    "tm":         team,
+                    "sp":         spawn,
+                    "sn":         snap,
+                    "cn":         cn,
+                    "ex":         ex,
+                    "ai_weapons": s["weapons"],
+                    "map_id":     s.get("map_id", "default"),
+                    "reconnect":  s["status"] == "in_game",
+                    "team_red":   s["team_red"],
+                    "team_blue":  s["team_blue"],
                 }))
                 await broadcast(mid, {"t": "sp", "u": uid, "tm": team,
                                        "sp": spawn, "cn": cn, "ex": ex}, exclude=uid)
