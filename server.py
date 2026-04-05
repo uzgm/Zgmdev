@@ -13,7 +13,7 @@ except ImportError:
 
 from ai_manager import run_ai_loop, WEAPON_STATS as _AI_WEAPON_STATS
 
-print("=== 서버 시작 ===", flush=True)
+print("=== 서버 시작 (룸 기반) ===", flush=True)
 
 RTDB_URL    = "https://zgm-base-default-rtdb.asia-southeast1.firebasedatabase.app/"
 RTDB_SECRET = os.environ.get("RTDB_SECRET", "")
@@ -22,36 +22,35 @@ REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 WS_PORT     = int(os.environ.get("PORT", 7860))
 WS_PING_INTERVAL = 20
 
-TEAM_SIZE      = 4
-SESSION_TTL    = 300
-JOIN_TIMEOUT   = 30.0
+# 게임 설정
+SESSION_TTL    = 600
 SYNC_TICK_RATE = 10
 AI_TICK_RATE   = 10
 MAX_MOVE_SPEED = 6.5
 KO_REVIVE_TIME = 20.0
 RESCUE_WINDOW  = 10.0
-
-WORKER_TICK  = 1.0
-AI_FILL_AFTER = 10.0
+WEAPON_SELECT_TIMEOUT = 30.0
 
 MAP_MIN_X = -16.0; MAP_MAX_X = 16.0
 MAP_MIN_Z = -9.0;  MAP_MAX_Z = 9.0
-ZONE_POS    = {"x": 0.0, "z": 0.0}
-ZONE_RADIUS = 4.0
 
 WEAPON_STATS = _AI_WEAPON_STATS
 WEAPONS = list(WEAPON_STATS.keys())
 MAPS    = ["default"]
 
-print(f"=== httpx 사용: {_USE_HTTPX} ===", flush=True)
-print(f"=== RTDB_SECRET 길이: {len(RTDB_SECRET)} ===", flush=True)
-print(f"=== REDIS_URL: {REDIS_URL[:30] if REDIS_URL else '없음'} ===", flush=True)
+print(f"=== httpx: {_USE_HTTPX} | RTDB_SECRET 길이: {len(RTDB_SECRET)} ===", flush=True)
 
+# ================================================================
+# 전역 상태
+# clients[uid]  = { ws, room_code, last_pos, last_pos_time, last_attack_time }
+# sessions[room_code] = {
+#   players, weapons, weapon_selected, connected, expected,
+#   status, host_uid, max_players, room_name, created_at,
+#   ai_uids
+# }
+# ================================================================
 clients: dict  = {}
 sessions: dict = {}
-
-_tickets: dict = {}
-_tickets_lock  = asyncio.Lock()
 
 _http_client = None
 
@@ -77,12 +76,14 @@ async def _put(url: str, data) -> bool:
     try:
         body = json.dumps(data)
         if _USE_HTTPX and _http_client:
-            r = await _http_client.put(url, content=body, headers={"Content-Type": "application/json"})
+            r = await _http_client.put(url, content=body,
+                                        headers={"Content-Type": "application/json"})
             return r.status_code == 200
         else:
             import urllib.request as ur
             loop = asyncio.get_event_loop()
-            req  = ur.Request(url, data=body.encode(), headers={"Content-Type": "application/json"}, method="PUT")
+            req  = ur.Request(url, data=body.encode(),
+                              headers={"Content-Type": "application/json"}, method="PUT")
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
             return True
     except Exception as e:
@@ -93,12 +94,14 @@ async def _patch(url: str, data) -> bool:
     try:
         body = json.dumps(data)
         if _USE_HTTPX and _http_client:
-            r = await _http_client.patch(url, content=body, headers={"Content-Type": "application/json"})
+            r = await _http_client.patch(url, content=body,
+                                          headers={"Content-Type": "application/json"})
             return r.status_code == 200
         else:
             import urllib.request as ur
             loop = asyncio.get_event_loop()
-            req  = ur.Request(url, data=body.encode(), headers={"Content-Type": "application/json"}, method="PATCH")
+            req  = ur.Request(url, data=body.encode(),
+                              headers={"Content-Type": "application/json"}, method="PATCH")
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
             return True
     except Exception as e:
@@ -125,6 +128,7 @@ def _redis_headers():
     return {"Authorization": f"Bearer {REDIS_TOKEN}", "Content-Type": "application/json"}
 
 async def redis_set(key, value, ex=SESSION_TTL) -> bool:
+    if not REDIS_URL: return False
     try:
         body = json.dumps(["SET", key, json.dumps(value), "EX", ex])
         if _USE_HTTPX and _http_client:
@@ -133,31 +137,16 @@ async def redis_set(key, value, ex=SESSION_TTL) -> bool:
         else:
             import urllib.request as ur
             loop = asyncio.get_event_loop()
-            req  = ur.Request(REDIS_URL, data=body.encode(), headers=_redis_headers(), method="POST")
+            req  = ur.Request(REDIS_URL, data=body.encode(),
+                              headers=_redis_headers(), method="POST")
             raw  = await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5).read())
             return json.loads(raw).get("result") == "OK"
     except Exception as e:
         print(f"[Redis SET 오류] {type(e).__name__}: {e}", flush=True)
         return False
 
-async def redis_get(key):
-    try:
-        body = json.dumps(["GET", key])
-        if _USE_HTTPX and _http_client:
-            r   = await _http_client.post(REDIS_URL, content=body, headers=_redis_headers())
-            raw = r.json().get("result")
-        else:
-            import urllib.request as ur
-            loop = asyncio.get_event_loop()
-            req  = ur.Request(REDIS_URL, data=body.encode(), headers=_redis_headers(), method="POST")
-            data = await loop.run_in_executor(None, lambda: json.loads(ur.urlopen(req, timeout=5).read()))
-            raw  = data.get("result")
-        return json.loads(raw) if raw else None
-    except Exception as e:
-        print(f"[Redis GET 오류] {type(e).__name__}: {e}", flush=True)
-        return None
-
 async def redis_del(key):
+    if not REDIS_URL: return
     try:
         body = json.dumps(["DEL", key])
         if _USE_HTTPX and _http_client:
@@ -165,7 +154,8 @@ async def redis_del(key):
         else:
             import urllib.request as ur
             loop = asyncio.get_event_loop()
-            req  = ur.Request(REDIS_URL, data=body.encode(), headers=_redis_headers(), method="POST")
+            req  = ur.Request(REDIS_URL, data=body.encode(),
+                              headers=_redis_headers(), method="POST")
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
     except Exception as e:
         print(f"[Redis DEL 오류] {type(e).__name__}: {e}", flush=True)
@@ -183,244 +173,6 @@ async def rtdb_delete(path):   await _delete(_rtdb(path))
 
 
 # ================================================================
-# 서버 시작 시 RTDB 잔여 데이터 정리
-# ================================================================
-async def cleanup_stale_rtdb():
-    print("[Startup] RTDB 잔여 데이터 정리...", flush=True)
-    data = await rtdb_get("match_queue/parties")
-    if data and isinstance(data, dict):
-        for pid, pp in data.items():
-            if pid.startswith("ai_party_"):
-                await rtdb_delete(f"match_queue/parties/{pid}")
-                continue
-            status = pp.get("status", "")
-            if status in ("matched", "loading", "in_game"):
-                await rtdb_patch(f"match_queue/parties/{pid}", {
-                    "status": "searching", "match_id": "", "assigned_team": ""
-                })
-    await rtdb_delete("active_matches")
-    print("[Startup] 정리 완료", flush=True)
-
-
-# ================================================================
-# 매치메이킹 워커
-# ================================================================
-async def matchmaking_worker():
-    print("[Worker] 매치메이킹 워커 시작", flush=True)
-    while True:
-        try:
-            await asyncio.sleep(WORKER_TICK)
-            await _worker_tick()
-        except Exception as e:
-            print(f"[Worker] 오류: {e}", flush=True)
-
-
-async def _worker_tick():
-    async with _tickets_lock:
-        if not _tickets:
-            return
-
-        now     = time.time()
-        tickets = list(_tickets.values())
-        total_real = sum(t["size"] for t in tickets)
-
-        print(f"[Worker] 틱 — 티켓 {len(tickets)}개 "
-              f"{[(t['pid'], t['size']) for t in tickets]} "
-              f"총인원={total_real}", flush=True)
-
-        if total_real >= TEAM_SIZE * 2:
-            ta_tickets, tb_tickets = _split_into_two_teams(tickets)
-            if ta_tickets and tb_tickets:
-                for t in ta_tickets + tb_tickets:
-                    _tickets.pop(t["pid"], None)
-                print(f"[Worker] 풀 매치 성공 "
-                      f"RED={[t['pid'] for t in ta_tickets]} "
-                      f"BLUE={[t['pid'] for t in tb_tickets]}", flush=True)
-                asyncio.create_task(create_match(ta_tickets, tb_tickets))
-                return
-
-        if total_real >= TEAM_SIZE:
-            ta_tickets, remaining = _take_up_to(tickets, TEAM_SIZE)
-            for t in ta_tickets:
-                _tickets.pop(t["pid"], None)
-            print(f"[Worker] 반 매치(RED실제+BLUE AI) "
-                  f"RED={[t['pid'] for t in ta_tickets]}", flush=True)
-            asyncio.create_task(_create_match_with_ai_blue(ta_tickets))
-            return
-
-        oldest_time = min(t["joined_at"] for t in tickets)
-        if now - oldest_time < AI_FILL_AFTER:
-            return
-
-        merged_members = {}
-        pids_used = []
-        for t in sorted(tickets, key=lambda x: x["joined_at"]):
-            for uid, info in t["members"].items():
-                if len(merged_members) >= TEAM_SIZE:
-                    break
-                merged_members[uid] = info
-            pids_used.append(t["pid"])
-            if len(merged_members) >= TEAM_SIZE:
-                break
-
-        real_count = len(merged_members)
-
-        if real_count < TEAM_SIZE:
-            for i in range(TEAM_SIZE - real_count):
-                merged_members[f"ai_fill_{i+1}"] = {
-                    "nickname": f"BOT_A{i+1}", "tag": "AI", "is_bot": True
-                }
-
-        ai_pid = f"ai_party_{int(time.time())}"
-        ai_members = {
-            f"ai_{i+1}": {"nickname": f"BOT_{i+1}", "tag": "AI", "is_bot": True}
-            for i in range(TEAM_SIZE)
-        }
-
-        ta = [{"pid": pids_used[0], "members": merged_members,
-               "size": TEAM_SIZE, "joined_at": oldest_time}]
-        tb = [{"pid": ai_pid, "members": ai_members,
-               "size": TEAM_SIZE, "joined_at": now}]
-
-        for pid in pids_used:
-            _tickets.pop(pid, None)
-
-        print(f"[Worker] AI 채움 — real={real_count} pids={pids_used}", flush=True)
-        asyncio.create_task(create_match(ta, tb))
-
-
-def _split_into_two_teams(tickets: list):
-    sorted_t = sorted(tickets, key=lambda x: x["joined_at"])
-    team_a_members, team_b_members = {}, {}
-    team_a_tickets, team_b_tickets = [], []
-    team_a_pids, team_b_pids = set(), set()
-
-    for t in sorted_t:
-        for uid, info in t["members"].items():
-            if len(team_a_members) < TEAM_SIZE:
-                team_a_members[uid] = info
-                if t["pid"] not in team_a_pids:
-                    team_a_pids.add(t["pid"])
-                    team_a_tickets.append(t)
-            elif len(team_b_members) < TEAM_SIZE:
-                team_b_members[uid] = info
-                if t["pid"] not in team_b_pids:
-                    team_b_pids.add(t["pid"])
-                    team_b_tickets.append(t)
-
-    if len(team_a_members) == TEAM_SIZE and len(team_b_members) == TEAM_SIZE:
-        ta = [{"pid": t["pid"],
-               "members": {uid: team_a_members[uid]
-                           for uid in t["members"] if uid in team_a_members},
-               "size": sum(1 for uid in t["members"] if uid in team_a_members),
-               "joined_at": t["joined_at"]}
-              for t in team_a_tickets]
-        tb = [{"pid": t["pid"],
-               "members": {uid: team_b_members[uid]
-                           for uid in t["members"] if uid in team_b_members},
-               "size": sum(1 for uid in t["members"] if uid in team_b_members),
-               "joined_at": t["joined_at"]}
-              for t in team_b_tickets]
-        return ta, tb
-
-    return None, None
-
-
-def _take_up_to(tickets: list, n: int):
-    sorted_t  = sorted(tickets, key=lambda x: x["joined_at"])
-    taken     = []
-    remaining = []
-    count     = 0
-    for t in sorted_t:
-        if count < n:
-            take = min(t["size"], n - count)
-            taken.append({"pid": t["pid"],
-                          "members": dict(list(t["members"].items())[:take]),
-                          "size": take,
-                          "joined_at": t["joined_at"]})
-            count += take
-        else:
-            remaining.append(t)
-    return taken, remaining
-
-
-async def _create_match_with_ai_blue(ta_tickets: list):
-    ai_pid = f"ai_party_{int(time.time())}"
-    tb = [{"pid": ai_pid,
-           "members": {f"ai_{i+1}": {"nickname": f"BOT_{i+1}", "tag": "AI", "is_bot": True}
-                       for i in range(TEAM_SIZE)},
-           "size": TEAM_SIZE,
-           "joined_at": time.time()}]
-    await create_match(ta_tickets, tb)
-
-
-# ================================================================
-# ★ HTTP 큐 엔드포인트 — WS 불안정 환경(모바일)용
-# POST /queue  body: {"uid": "...", "pid": "...", "members": {...}}
-# DELETE /queue?pid=...
-# ================================================================
-@app.post("/queue")
-async def http_enqueue(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
-
-    uid     = body.get("uid", "")
-    pid     = body.get("pid", "")
-    members = body.get("members", {})
-
-    if not uid or not pid:
-        return JSONResponse({"ok": False, "error": "uid/pid required"}, status_code=400)
-
-    if not members:
-        members = {uid: {"nickname": uid, "tag": "PLAYER", "is_bot": False}}
-
-    # RTDB 파티 상태 → searching
-    await rtdb_patch(f"match_queue/parties/{pid}", {
-        "status": "searching", "match_id": "", "assigned_team": ""
-    })
-
-    await enqueue_ticket(pid, members)
-    print(f"[HTTP Queue] 등록 — uid={uid} pid={pid} size={len(members)}", flush=True)
-    return JSONResponse({"ok": True})
-
-
-@app.delete("/queue")
-async def http_dequeue(pid: str = ""):
-    if not pid:
-        return JSONResponse({"ok": False, "error": "pid required"}, status_code=400)
-    await dequeue_ticket(pid)
-    await rtdb_patch(f"match_queue/parties/{pid}", {
-        "status": "waiting", "match_id": "", "assigned_team": ""
-    })
-    print(f"[HTTP Queue] 취소 — pid={pid}", flush=True)
-    return JSONResponse({"ok": True})
-
-
-# ================================================================
-# 티켓 등록 / 취소
-# ================================================================
-async def enqueue_ticket(pid: str, members: dict):
-    async with _tickets_lock:
-        _tickets[pid] = {
-            "pid":       pid,
-            "members":   members,
-            "size":      len(members),
-            "joined_at": time.time(),
-        }
-    print(f"[Ticket] 등록 — pid={pid} size={len(members)} "
-          f"총티켓={len(_tickets)}", flush=True)
-
-
-async def dequeue_ticket(pid: str):
-    async with _tickets_lock:
-        removed = _tickets.pop(pid, None)
-    if removed:
-        print(f"[Ticket] 제거 — pid={pid}", flush=True)
-
-
-# ================================================================
 # lifespan
 # ================================================================
 @asynccontextmanager
@@ -428,10 +180,8 @@ async def lifespan(app: FastAPI):
     global _http_client
     if _USE_HTTPX:
         _http_client = httpx.AsyncClient(timeout=5.0)
-    await cleanup_stale_rtdb()
-    worker_task = asyncio.create_task(matchmaking_worker())
+    print("[Startup] 룸 기반 서버 준비 완료", flush=True)
     yield
-    worker_task.cancel()
     if _http_client:
         await _http_client.aclose()
 
@@ -442,7 +192,8 @@ app = FastAPI(lifespan=lifespan)
 # 게임 로직 유틸
 # ================================================================
 def dist_2d(a: dict, b: dict) -> float:
-    return math.sqrt((a.get("x",0)-b.get("x",0))**2 + (a.get("z",0)-b.get("z",0))**2)
+    return math.sqrt((a.get("x", 0) - b.get("x", 0))**2 +
+                     (a.get("z", 0) - b.get("z", 0))**2)
 
 def clamp_pos(x, z):
     return max(MAP_MIN_X, min(MAP_MAX_X, x)), max(MAP_MIN_Z, min(MAP_MAX_Z, z))
@@ -476,10 +227,10 @@ def check_attack_cooldown(uid: str, weapon: str) -> bool:
 # ================================================================
 # 브로드캐스트
 # ================================================================
-async def broadcast(mid: str, msg: dict, exclude=None):
+async def broadcast(room_code: str, msg: dict, exclude=None):
     data    = json.dumps(msg, ensure_ascii=False)
     targets = [(uid, info) for uid, info in list(clients.items())
-               if info["mid"] == mid and uid != exclude]
+               if info.get("room_code") == room_code and uid != exclude]
 
     async def _send(uid, info):
         try:
@@ -502,25 +253,22 @@ async def send_to(uid: str, msg: dict):
 async def _cleanup_client(uid: str):
     info = clients.pop(uid, None)
     if not info: return
-    mid = info.get("mid", "")
-    sess_status = "N/A"
-    if mid and mid in sessions:
-        s = sessions[mid]
-        sess_status = s["status"]
+    room_code = info.get("room_code", "")
+    if room_code and room_code in sessions:
+        s = sessions[room_code]
         s["connected"].discard(uid)
-        s["weapon_selected"].discard(uid)
         p = s["players"].get(uid)
         if p: p["disconnected"] = True
         if s["status"] == "in_game":
-            await broadcast(mid, {"t": "l", "u": uid})
-    print(f"[정리] {uid} 완료 (세션상태: {sess_status})", flush=True)
+            await broadcast(room_code, {"t": "l", "u": uid})
+    print(f"[정리] {uid} 완료", flush=True)
 
 
 # ================================================================
 # 스냅샷 / 싱크
 # ================================================================
-def build_snapshot(mid: str, exclude_uid: str) -> dict:
-    s    = sessions.get(mid, {})
+def build_snapshot(room_code: str, exclude_uid: str) -> dict:
+    s    = sessions.get(room_code, {})
     snap = {}
     for uid, p in s.get("players", {}).items():
         if uid == exclude_uid: continue
@@ -540,11 +288,11 @@ def _state_sig(p: dict) -> str:
     return (f"{round(p.get('x',0),1)},{round(p.get('z',0),1)},"
             f"{p.get('hp',100)},{p.get('ko',False)},{p.get('an','idle')}")
 
-async def sync_loop(mid: str):
-    interval  = 1.0 / SYNC_TICK_RATE
+async def sync_loop(room_code: str):
+    interval   = 1.0 / SYNC_TICK_RATE
     last_sigs: dict = {}
-    while mid in sessions and sessions[mid]["status"] == "in_game":
-        s     = sessions[mid]
+    while room_code in sessions and sessions[room_code]["status"] == "in_game":
+        s     = sessions[room_code]
         delta = {}
         for uid, p in s["players"].items():
             sig = _state_sig(p)
@@ -561,27 +309,29 @@ async def sync_loop(mid: str):
                     "tm": p.get("tm", "r"),
                 }
         if delta:
-            await broadcast(mid, {"t": "sv", "pos": delta, "ts": int(time.time()*1000)})
+            await broadcast(room_code,
+                            {"t": "sv", "pos": delta, "ts": int(time.time() * 1000)})
         await asyncio.sleep(interval)
 
 
 # ================================================================
 # KO / 전투
 # ================================================================
-async def ko_timer(mid: str, uid: str):
+async def ko_timer(room_code: str, uid: str):
     await asyncio.sleep(KO_REVIVE_TIME)
-    if mid not in sessions: return
-    s = sessions[mid]
+    if room_code not in sessions: return
+    s = sessions[room_code]
     p = s["players"].get(uid)
     if not p or not p.get("ko", False): return
     p["nav_wp"] = None; p["nav_wait"] = 0
     p["ko"] = False; p["hp"] = 30; p["penalty"] = True
     print(f"[KO] {uid} 자동 기상", flush=True)
-    await broadcast(mid, {"t": "rev", "uid": uid, "hp": 30, "penalty": True, "auto": True})
+    await broadcast(room_code,
+                    {"t": "rev", "uid": uid, "hp": 30, "penalty": True, "auto": True})
 
-async def process_attack(mid: str, attacker_uid: str, msg: dict):
-    if mid not in sessions: return
-    s        = sessions[mid]
+async def process_attack(room_code: str, attacker_uid: str, msg: dict):
+    if room_code not in sessions: return
+    s        = sessions[room_code]
     attacker = s["players"].get(attacker_uid)
     if not attacker or attacker.get("ko", False): return
     weapon    = s["weapons"].get(attacker_uid, {}).get("weapon", "baguette")
@@ -598,18 +348,18 @@ async def process_attack(mid: str, attacker_uid: str, msg: dict):
         if target.get("ko", False): continue
         if dist_2d(attacker, target) > atk_range: continue
         target["hp"] = max(0, target["hp"] - damage)
-        await broadcast(mid, {"t": "hit", "attacker": attacker_uid,
-                               "target": tid, "damage": damage,
-                               "hp": target["hp"], "weapon": weapon})
+        await broadcast(room_code,
+                        {"t": "hit", "attacker": attacker_uid, "target": tid,
+                         "damage": damage, "hp": target["hp"], "weapon": weapon})
         if target["hp"] <= 0:
             target["hp"] = 0; target["ko"] = True; target["ko_time"] = time.time()
             target["nav_wp"] = None; target["nav_wait"] = 0
-            await broadcast(mid, {"t": "ko", "uid": tid})
-            asyncio.create_task(ko_timer(mid, tid))
+            await broadcast(room_code, {"t": "ko", "uid": tid})
+            asyncio.create_task(ko_timer(room_code, tid))
 
-async def process_rescue(mid: str, rescuer_uid: str, target_uid: str):
-    if mid not in sessions: return
-    s       = sessions[mid]
+async def process_rescue(room_code: str, rescuer_uid: str, target_uid: str):
+    if room_code not in sessions: return
+    s       = sessions[room_code]
     rescuer = s["players"].get(rescuer_uid)
     target  = s["players"].get(target_uid)
     if not rescuer or not target: return
@@ -618,70 +368,69 @@ async def process_rescue(mid: str, rescuer_uid: str, target_uid: str):
     if dist_2d(rescuer, target) > 1.5: return
     elapsed = time.time() - target.get("ko_time", time.time())
     if elapsed > RESCUE_WINDOW:
-        await send_to(rescuer_uid, {"t": "res_fail", "target": target_uid, "reason": "timeout"})
+        await send_to(rescuer_uid,
+                      {"t": "res_fail", "target": target_uid, "reason": "timeout"})
         return
     target["nav_wp"] = None; target["nav_wait"] = 0
     target["ko"] = False; target["hp"] = 100; target["penalty"] = False
-    await broadcast(mid, {"t": "rev", "uid": target_uid, "hp": 100,
-                           "penalty": False, "auto": False, "rescuer": rescuer_uid})
+    await broadcast(room_code,
+                    {"t": "rev", "uid": target_uid, "hp": 100,
+                     "penalty": False, "auto": False, "rescuer": rescuer_uid})
 
 
 # ================================================================
-# 매치 생성
+# 룸 세션 생성 (RTDB 방 데이터 기반)
 # ================================================================
-async def create_match(ta: list, tb: list):
-    mid    = f"m{int(time.time()*1000)}"
-    a_pids = [t["pid"] for t in ta]
-    b_pids = [t["pid"] for t in tb]
+async def create_game_session(room_code: str, room_data: dict):
+    """
+    RTDB의 방 데이터를 읽어 서버 인메모리 세션을 생성한다.
+    호스트가 게임 시작 버튼을 누를 때 WS t=start_game 으로 호출됨.
+    """
+    if room_code in sessions:
+        print(f"[Session] {room_code} 이미 존재", flush=True)
+        return
 
-    def get_uids(team_tickets):
-        return list(dict.fromkeys(uid for t in team_tickets for uid in t["members"]))
+    players_data = room_data.get("players", {})
+    host_uid     = room_data.get("hostId", "")
+    max_players  = room_data.get("maxPlayers", 4)
 
-    a_uids = get_uids(ta)
-    b_uids = get_uids(tb)
-
-    if set(a_uids) & set(b_uids): return
-    if len(a_uids) != TEAM_SIZE or len(b_uids) != TEAM_SIZE: return
-
-    all_uids  = a_uids + b_uids
-    real_uids = [u for u in all_uids if not u.startswith("ai_")]
-    ai_uids   = [u for u in all_uids if u.startswith("ai_")]
-    sel_map   = random.choice(MAPS)
-
-    ai_weapons = {uid: {"weapon": (w := random.choice(WEAPONS)), **WEAPON_STATS[w]}
-                  for uid in ai_uids}
-
-    print(f"[Match] {mid} RED:{a_uids} BLUE:{b_uids}", flush=True)
-
-    redis_ok = await redis_set(f"s:{mid}", {
-        "mid": mid, "status": "loading",
-        "team_red": a_uids, "team_blue": b_uids,
-        "map_id": sel_map, "created_at": int(time.time())
-    })
-    print(f"[Match] Redis: {'성공' if redis_ok else '실패 → 메모리로 계속'}", flush=True)
-
-    for pid in a_pids:
-        if not pid.startswith("ai_party_"):
-            await rtdb_patch(f"match_queue/parties/{pid}",
-                             {"match_id": mid, "assigned_team": "r", "status": "matched"})
-    for pid in b_pids:
-        if not pid.startswith("ai_party_"):
-            await rtdb_patch(f"match_queue/parties/{pid}",
-                             {"match_id": mid, "assigned_team": "b", "status": "matched"})
-
-    red_ai  = [u for u in a_uids if u.startswith("ai_")]
-    blue_ai = [u for u in b_uids if u.startswith("ai_")]
-    ri = bi = 0
-    ai_players = {}
-    for uid in ai_uids:
-        team    = "r" if uid in a_uids else "b"
-        ai_list = red_ai if team == "r" else blue_ai
-        idx     = ai_list.index(uid) if uid in ai_list else 0
-        role    = "defender" if idx % 2 == 0 else "pressure"
-        if team == "r":
-            spawn = {"x": -10.0 + ri * 0.5, "y": 0.5, "z": float(ri * 2 - 3)}; ri += 1
+    # 플레이어 목록: 실제 유저 + AI
+    real_uids = []
+    ai_uids   = []
+    for uid, pinfo in players_data.items():
+        if pinfo.get("isAI", False):
+            ai_uids.append(uid)
         else:
-            spawn = {"x": 10.0 + bi * 0.5,  "y": 0.5, "z": float(bi * 2 - 3)}; bi += 1
+            real_uids.append(uid)
+
+    # 팀 배정: 절반씩 나눔 (호스트는 항상 레드)
+    all_uids = real_uids + ai_uids
+    half     = max(1, len(all_uids) // 2)
+    team_red  = all_uids[:half]
+    team_blue = all_uids[half:]
+
+    sel_map = random.choice(MAPS)
+
+    # AI 플레이어 초기화
+    ai_players  = {}
+    ai_weapons  = {}
+    red_idx = 0; blue_idx = 0
+
+    for uid in ai_uids:
+        team   = "r" if uid in team_red else "b"
+        weapon = random.choice(WEAPONS)
+        ai_weapons[uid] = {"weapon": weapon, **WEAPON_STATS[weapon]}
+
+        if team == "r":
+            spawn = {"x": -10.0 + red_idx * 0.5, "y": 0.5,
+                     "z": float(red_idx * 2 - 3)}
+            red_idx += 1
+        else:
+            spawn = {"x": 10.0 + blue_idx * 0.5, "y": 0.5,
+                     "z": float(blue_idx * 2 - 3)}
+            blue_idx += 1
+
+        role = "defender" if (red_idx + blue_idx) % 2 == 0 else "pressure"
         ai_players[uid] = {
             "tm": team, "hp": 100, "ko": False, "penalty": False,
             "atk_cd": random.uniform(0, 1.2),
@@ -690,68 +439,154 @@ async def create_match(ta: list, tb: list):
             "disconnected": False,
             **spawn, "ry": 0.0 if team == "r" else 3.14, "an": "idle"
         }
-        print(f"  AI {uid}({team}) role={role}", flush=True)
 
-    sessions[mid] = {
+    sessions[room_code] = {
         "expected":        set(real_uids),
         "connected":       set(),
-        "players":         ai_players,
+        "players":         ai_players,       # AI는 미리 채워둠, 실제 유저는 j 때 추가
         "weapons":         dict(ai_weapons),
-        "weapon_selected": set(),
+        "weapon_selected": set(ai_uids),     # AI는 이미 선택된 것으로 처리
         "map_id":          sel_map,
-        "team_red":        a_uids,
-        "team_blue":       b_uids,
+        "team_red":        team_red,
+        "team_blue":       team_blue,
         "status":          "loading",
-        "party_ids":       a_pids + b_pids,
+        "host_uid":        host_uid,
+        "max_players":     max_players,
+        "room_name":       room_data.get("roomName", "방 " + room_code),
+        "ai_uids":         ai_uids,
+        "created_at":      time.time(),
     }
-    print(f"[Match] {mid} 등록 완료 (실:{len(real_uids)} AI:{len(ai_uids)})", flush=True)
-    asyncio.create_task(watch_timeout(mid))
+
+    print(f"[Session] {room_code} 생성 완료 "
+          f"real={len(real_uids)} AI={len(ai_uids)} "
+          f"RED={team_red} BLUE={team_blue}", flush=True)
+
+    # RTDB에 gameStatus = starting 기록
+    await rtdb_patch(f"rooms/{room_code}", {
+        "gameStatus": "starting",
+        "serverSessionId": room_code,
+    })
+
+    # 세션 타임아웃 감시
+    asyncio.create_task(_session_timeout_watch(room_code))
+
+    return sessions[room_code]
 
 
-async def watch_timeout(mid):
+async def _session_timeout_watch(room_code: str):
+    """실제 유저가 JOIN_TIMEOUT 안에 접속 안 하면 세션 정리"""
+    JOIN_TIMEOUT = 60.0
     await asyncio.sleep(JOIN_TIMEOUT)
-    if mid not in sessions or sessions[mid]["status"] == "in_game":
-        return
-    print(f"[Timeout] {mid} JOIN_TIMEOUT({JOIN_TIMEOUT}s) 초과 → 정리", flush=True)
-    await broadcast(mid, {"t": "s", "r": "timeout"})
-    await cancel_session(mid)
+    if room_code not in sessions: return
+    s = sessions[room_code]
+    if s["status"] == "in_game": return
+    print(f"[Timeout] {room_code} JOIN_TIMEOUT 초과 → 정리", flush=True)
+    await broadcast(room_code, {"t": "s", "r": "timeout"})
+    await _cancel_session(room_code)
 
-async def cancel_session(mid):
-    if mid not in sessions: return
-    s = sessions.pop(mid)
-    await redis_del(f"s:{mid}")
-    await rtdb_delete(f"active_matches/{mid}")
-    for pid in s.get("party_ids", []):
-        if pid.startswith("ai_party_"):
-            await rtdb_delete(f"match_queue/parties/{pid}")
-        else:
-            await rtdb_patch(f"match_queue/parties/{pid}", {
-                "match_id": "", "assigned_team": "", "status": "searching"
-            })
-    print(f"[Session] {mid} 완전 정리", flush=True)
 
-async def check_all_weapons_selected(mid):
-    if mid not in sessions: return
-    s = sessions[mid]
+async def _cancel_session(room_code: str):
+    if room_code not in sessions: return
+    sessions.pop(room_code, None)
+    await redis_del(f"room:{room_code}")
+    await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "waiting"})
+    print(f"[Session] {room_code} 정리 완료", flush=True)
+
+
+async def check_all_weapons_selected(room_code: str):
+    if room_code not in sessions: return
+    s = sessions[room_code]
+    # 실제 유저 전원 + AI(이미 처리됨) 선택 완료 여부
     if s["expected"] != s["weapon_selected"]: return
     s["status"] = "in_game"
-    print(f"[Weapon] {mid} 전원 선택 → 게임 시작", flush=True)
-    await broadcast(mid, {
+    print(f"[Weapon] {room_code} 전원 선택 → 게임 시작", flush=True)
+    await broadcast(room_code, {
         "t":         "w_ready",
-        "mid":       mid,
+        "room_code": room_code,
         "weapons":   s["weapons"],
         "map_id":    s.get("map_id", "default"),
-        "r":         s["team_red"],
-        "b":         s["team_blue"],
         "team_red":  s["team_red"],
         "team_blue": s["team_blue"],
     })
-    rd = await redis_get(f"s:{mid}")
-    if rd:
-        rd["status"] = "in_game"
-        await redis_set(f"s:{mid}", rd)
-    asyncio.create_task(sync_loop(mid))
-    asyncio.create_task(run_ai_loop(mid, sessions, broadcast, ko_timer, AI_TICK_RATE))
+    # RTDB 상태 업데이트
+    await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "playing"})
+    asyncio.create_task(sync_loop(room_code))
+    asyncio.create_task(run_ai_loop(room_code, sessions, broadcast, ko_timer, AI_TICK_RATE))
+
+
+# ================================================================
+# HTTP 엔드포인트
+# ================================================================
+
+# ── 룸 시작 (호스트 전용 HTTP 트리거, WS로도 가능)
+@app.post("/room/start")
+async def http_room_start(request: Request):
+    """
+    Godot 클라이언트가 직접 호출 가능한 게임 시작 트리거.
+    body: { "room_code": "ABCDEF", "host_uid": "...", "room_data": {...} }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    room_code = body.get("room_code", "").upper().strip()
+    host_uid  = body.get("host_uid", "")
+    room_data = body.get("room_data", {})
+
+    if not room_code:
+        return JSONResponse({"ok": False, "error": "room_code required"}, status_code=400)
+
+    # 이미 세션 있으면 중복 방지
+    if room_code in sessions:
+        s = sessions[room_code]
+        return JSONResponse({
+            "ok": True,
+            "already_exists": True,
+            "status": s["status"],
+            "team_red": s["team_red"],
+            "team_blue": s["team_blue"],
+        })
+
+    # RTDB에서 방 데이터 가져오기 (room_data가 없을 경우)
+    if not room_data:
+        room_data = await rtdb_get(f"rooms/{room_code}")
+        if not room_data:
+            return JSONResponse({"ok": False, "error": "room not found"}, status_code=404)
+
+    # 호스트 검증
+    if room_data.get("hostId", "") != host_uid:
+        return JSONResponse({"ok": False, "error": "not host"}, status_code=403)
+
+    sess = await create_game_session(room_code, room_data)
+    if not sess:
+        return JSONResponse({"ok": False, "error": "session create failed"}, status_code=500)
+
+    print(f"[HTTP] 룸 시작 — room_code={room_code} host={host_uid}", flush=True)
+    return JSONResponse({
+        "ok":        True,
+        "room_code": room_code,
+        "team_red":  sess["team_red"],
+        "team_blue": sess["team_blue"],
+        "map_id":    sess["map_id"],
+    })
+
+
+@app.get("/room/{room_code}/status")
+async def http_room_status(room_code: str):
+    room_code = room_code.upper().strip()
+    if room_code not in sessions:
+        return JSONResponse({"ok": False, "exists": False})
+    s = sessions[room_code]
+    return JSONResponse({
+        "ok":        True,
+        "exists":    True,
+        "status":    s["status"],
+        "connected": len(s["connected"]),
+        "expected":  len(s["expected"]),
+        "team_red":  s["team_red"],
+        "team_blue": s["team_blue"],
+    })
 
 
 # ================================================================
@@ -760,103 +595,90 @@ async def check_all_weapons_selected(mid):
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    uid = None; mid = None
+    uid       = None
+    room_code = None
     print("[WS] 연결", flush=True)
     try:
         while True:
             raw = await ws.receive_text()
-            try: msg = json.loads(raw)
-            except: continue
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
             t = msg.get("t", "")
 
-            # ── 큐 신청 (WS 경로 — 하위호환 유지) ─────────────────
-            if t == "q":
-                uid     = msg.get("u", "")
-                pid     = msg.get("pid", "")
-                members = msg.get("members", None)
+            # ── 게임 참가 (룸 코드 + 유저 ID)
+            if t == "j":
+                uid       = msg.get("u", "")
+                room_code = msg.get("room_code", "").upper().strip()
+                team_hint = msg.get("tm", "")   # 클라이언트가 알고 있는 팀 (옵션)
 
-                print(f"[q/WS] 큐 신청: uid={uid} pid={pid}", flush=True)
+                if not room_code or room_code not in sessions:
+                    await ws.send_text(json.dumps({"t": "f", "r": "no_session"}))
+                    continue
 
-                if not pid:
-                    all_parties = await rtdb_get("match_queue/parties")
-                    if all_parties and isinstance(all_parties, dict):
-                        for fpid, fp in all_parties.items():
-                            if uid in fp.get("members", {}) and not fpid.startswith("ai_party_"):
-                                pid = fpid
-                                if not members:
-                                    members = fp.get("members", {})
-                                break
-                    if not pid:
-                        pid = uid
+                s = sessions[room_code]
 
-                if not members and pid:
-                    party_data = await rtdb_get(f"match_queue/parties/{pid}")
-                    if party_data and isinstance(party_data, dict):
-                        members = party_data.get("members", {})
-
-                if not members:
-                    members = {uid: {"nickname": uid, "tag": "PLAYER"}}
-
-                if pid and not pid.startswith("ai_party_"):
-                    await rtdb_patch(f"match_queue/parties/{pid}", {
-                        "status": "searching", "match_id": "", "assigned_team": ""
-                    })
-
-                await enqueue_ticket(pid, members)
-                await ws.send_text(json.dumps({"t": "w"}))
-                # ★ WS 큐 신청 후 연결 유지 (클라이언트가 끊어도 티켓은 살아있음)
-
-            # ── 큐 취소 ────────────────────────────────────────────
-            elif t == "q_cancel":
-                pid = msg.get("pid", "")
-                if pid:
-                    await dequeue_ticket(pid)
-                    await rtdb_patch(f"match_queue/parties/{pid}", {
-                        "status": "idle", "match_id": "", "assigned_team": ""
-                    })
-                await ws.send_text(json.dumps({"t": "q_cancelled"}))
-
-            # ── 게임 참가 ──────────────────────────────────────────
-            elif t == "j":
-                uid  = msg.get("u", "")
-                mid  = msg.get("mid", "")
-                team = msg.get("tm", "r")
-                if mid not in sessions:
-                    await ws.send_text(json.dumps({"t": "f", "r": "inv"})); continue
-                s = sessions[mid]
                 if uid not in s["expected"]:
-                    await ws.send_text(json.dumps({"t": "f", "r": "na"})); continue
+                    await ws.send_text(json.dumps({"t": "f", "r": "na"}))
+                    continue
+
+                # 기존 연결 정리
                 if uid in clients:
                     old_ws = clients[uid].get("ws")
                     if old_ws and old_ws is not ws:
                         try: await old_ws.close()
                         except: pass
                     clients.pop(uid, None)
+
+                # 팀 결정 (서버 기준 우선)
+                if uid in s["team_red"]:
+                    team = "r"
+                elif uid in s["team_blue"]:
+                    team = "b"
+                else:
+                    team = team_hint if team_hint in ("r", "b") else "r"
+
                 clients[uid] = {
-                    "ws": ws, "mid": mid, "team": team,
-                    "last_pos": None, "last_pos_time": time.time(),
+                    "ws":               ws,
+                    "room_code":        room_code,
+                    "team":             team,
+                    "last_pos":         None,
+                    "last_pos_time":    time.time(),
                     "last_attack_time": 0,
                 }
                 s["connected"].add(uid)
-                if uid in s["players"] and s["players"][uid].get("disconnected", False):
-                    p = s["players"][uid]; p["disconnected"] = False
-                    spawn = {"x": p["x"], "y": p["y"], "z": p["z"], "ry": p["ry"], "an": "idle"}
+
+                # 스폰 위치 결정
+                is_reconnect = uid in s["players"] and not s["players"][uid].get("disconnected", True)
+                if is_reconnect:
+                    p = s["players"][uid]
+                    p["disconnected"] = False
+                    spawn = {"x": p["x"], "y": p["y"], "z": p["z"],
+                             "ry": p["ry"], "an": "idle"}
                 else:
+                    idx = len([u for u in s["team_red"] if u in s["connected"]]) - 1 \
+                          if team == "r" else \
+                          len([u for u in s["team_blue"] if u in s["connected"]]) - 1
                     if team == "r":
-                        idx   = len([u for u in s["team_red"] if u in s["connected"]]) - 1
-                        spawn = {"x": -10.0, "y": 0.5, "z": float(idx*2), "ry": 0.0, "an": "idle"}
+                        spawn = {"x": -10.0, "y": 0.5,
+                                 "z": float(max(idx, 0) * 2), "ry": 0.0, "an": "idle"}
                     else:
-                        idx   = len([u for u in s["team_blue"] if u in s["connected"]]) - 1
-                        spawn = {"x": 10.0, "y": 0.5, "z": float(idx*2), "ry": 3.14, "an": "idle"}
+                        spawn = {"x": 10.0, "y": 0.5,
+                                 "z": float(max(idx, 0) * 2), "ry": 3.14, "an": "idle"}
                     s["players"][uid] = {
                         "tm": team, "hp": 100, "ko": False, "penalty": False,
                         "nav_wp": None, "nav_wait": 0, "strafe_dir": 1,
                         "flank_side": 0, "tick": 0, "ai_role": "none",
                         "disconnected": False, **spawn
                     }
+
                 clients[uid]["last_pos"] = {"x": spawn["x"], "y": spawn["y"], "z": spawn["z"]}
-                cn = len(s["connected"]); ex = len(s["expected"])
-                snap = build_snapshot(mid, uid)
+
+                snap = build_snapshot(room_code, uid)
+                cn   = len(s["connected"])
+                ex   = len(s["expected"])
+
                 await ws.send_text(json.dumps({
                     "t":          "js",
                     "u":          uid,
@@ -870,20 +692,32 @@ async def websocket_endpoint(ws: WebSocket):
                     "reconnect":  s["status"] == "in_game",
                     "team_red":   s["team_red"],
                     "team_blue":  s["team_blue"],
+                    "room_code":  room_code,
                 }))
-                await broadcast(mid, {"t": "sp", "u": uid, "tm": team,
-                                       "sp": spawn, "cn": cn, "ex": ex}, exclude=uid)
-                if s["expected"] == s["connected"]:
-                    await broadcast(mid, {"t": "g", "mid": mid,
-                                           "r": s["team_red"], "b": s["team_blue"]})
 
+                await broadcast(room_code,
+                                {"t": "sp", "u": uid, "tm": team,
+                                 "sp": spawn, "cn": cn, "ex": ex},
+                                exclude=uid)
+
+                # 전원 접속 완료 시 게임 준비 알림
+                if s["expected"] == s["connected"]:
+                    await broadcast(room_code, {
+                        "t":         "g",
+                        "room_code": room_code,
+                        "r":         s["team_red"],
+                        "b":         s["team_blue"],
+                    })
+
+            # ── 무기 선택
             elif t == "w_sel":
-                uid    = msg.get("u", ""); mid = msg.get("mid", "")
-                weapon = msg.get("weapon", "baguette")
-                if mid not in sessions: continue
-                s = sessions[mid]
+                uid       = msg.get("u", "")
+                room_code = msg.get("room_code", "").upper().strip()
+                weapon    = msg.get("weapon", "baguette")
+                if room_code not in sessions: continue
+                s = sessions[room_code]
                 if weapon not in WEAPON_STATS: weapon = "baguette"
-                s["weapons"][uid] = {"weapon": weapon, **WEAPON_STATS[weapon]}
+                s["weapons"][uid]         = {"weapon": weapon, **WEAPON_STATS[weapon]}
                 s["weapon_selected"].add(uid)
                 await ws.send_text(json.dumps({
                     "t":        "w_ok",
@@ -891,12 +725,16 @@ async def websocket_endpoint(ws: WebSocket):
                     "stats":    WEAPON_STATS[weapon],
                     "cooldown": WEAPON_STATS[weapon]["cooldown"],
                 }))
-                asyncio.create_task(check_all_weapons_selected(mid))
+                asyncio.create_task(check_all_weapons_selected(room_code))
 
+            # ── 이동
             elif t == "mv":
-                uid = msg.get("u", ""); mid = msg.get("mid", "")
-                if mid not in sessions or uid not in clients: continue
-                s = sessions[mid]
+                uid       = msg.get("u", "")
+                room_code = msg.get("room_code", "")
+                if not room_code and uid in clients:
+                    room_code = clients[uid].get("room_code", "")
+                if room_code not in sessions or uid not in clients: continue
+                s = sessions[room_code]
                 if uid not in s["players"]: continue
                 new_x = float(msg.get("x", 0))
                 new_y = float(msg.get("y", 0.5))
@@ -913,14 +751,23 @@ async def websocket_endpoint(ws: WebSocket):
                                         "x": pos["x"], "y": pos["y"], "z": pos["z"],
                                         "force": True})
 
+            # ── 공격
             elif t == "atk":
-                uid = msg.get("u", ""); mid = msg.get("mid", "")
-                asyncio.create_task(process_attack(mid, uid, msg))
+                uid       = msg.get("u", "")
+                room_code = msg.get("room_code", "")
+                if not room_code and uid in clients:
+                    room_code = clients[uid].get("room_code", "")
+                asyncio.create_task(process_attack(room_code, uid, msg))
 
+            # ── 구조
             elif t == "res":
-                uid = msg.get("u", ""); mid = msg.get("mid", "")
-                asyncio.create_task(process_rescue(mid, uid, msg.get("target", "")))
+                uid       = msg.get("u", "")
+                room_code = msg.get("room_code", "")
+                if not room_code and uid in clients:
+                    room_code = clients[uid].get("room_code", "")
+                asyncio.create_task(process_rescue(room_code, uid, msg.get("target", "")))
 
+            # ── 핑
             elif t == "p":
                 await ws.send_text(json.dumps({"t": "po"}))
 
@@ -943,8 +790,7 @@ async def health():
         "status":          "ok",
         "clients":         len(clients),
         "sessions":        len(sessions),
-        "tickets":         len(_tickets),
-        "ticket_pids":     list(_tickets.keys()),
+        "session_codes":   list(sessions.keys()),
         "httpx":           _USE_HTTPX,
         "rtdb_secret_len": len(RTDB_SECRET),
     }
@@ -955,8 +801,11 @@ async def health_head():
 
 
 if __name__ == "__main__":
-    for var, name in [(RTDB_SECRET,"RTDB_SECRET"),(REDIS_URL,"REDIS_URL"),(REDIS_TOKEN,"REDIS_TOKEN")]:
-        if not var: print(f"[Server] 경고: {name} 없음!", flush=True)
+    for var, name in [(RTDB_SECRET, "RTDB_SECRET"),
+                      (REDIS_URL, "REDIS_URL"),
+                      (REDIS_TOKEN, "REDIS_TOKEN")]:
+        if not var:
+            print(f"[Server] 경고: {name} 없음!", flush=True)
     print(f"[Server] 포트 {WS_PORT}", flush=True)
     uvicorn.run(
         app, host="0.0.0.0", port=WS_PORT,
