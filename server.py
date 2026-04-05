@@ -23,20 +23,21 @@ WS_PORT     = int(os.environ.get("PORT", 7860))
 WS_PING_INTERVAL = 20
 
 # 게임 설정
-SESSION_TTL    = 600
-SYNC_TICK_RATE = 10
-AI_TICK_RATE   = 10
-MAX_MOVE_SPEED = 6.5
-KO_REVIVE_TIME = 20.0
-RESCUE_WINDOW  = 10.0
+SESSION_TTL           = 600
+SYNC_TICK_RATE        = 10
+AI_TICK_RATE          = 10
+MAX_MOVE_SPEED        = 6.5
+KO_REVIVE_TIME        = 20.0
+RESCUE_WINDOW         = 10.0
 WEAPON_SELECT_TIMEOUT = 30.0
+JOIN_TIMEOUT          = 60.0
 
 MAP_MIN_X = -16.0; MAP_MAX_X = 16.0
 MAP_MIN_Z = -9.0;  MAP_MAX_Z = 9.0
 
 WEAPON_STATS = _AI_WEAPON_STATS
-WEAPONS = list(WEAPON_STATS.keys())
-MAPS    = ["default"]
+WEAPONS      = list(WEAPON_STATS.keys())
+MAPS         = ["default"]
 
 print(f"=== httpx: {_USE_HTTPX} | RTDB_SECRET 길이: {len(RTDB_SECRET)} ===", flush=True)
 
@@ -45,11 +46,11 @@ print(f"=== httpx: {_USE_HTTPX} | RTDB_SECRET 길이: {len(RTDB_SECRET)} ===", f
 # clients[uid]  = { ws, room_code, last_pos, last_pos_time, last_attack_time }
 # sessions[room_code] = {
 #   players, weapons, weapon_selected, connected, expected,
-#   status, host_uid, max_players, room_name, created_at,
-#   ai_uids
+#   status, host_uid, max_players, room_name, created_at, ai_uids,
+#   team_red, team_blue, map_id
 # }
 # ================================================================
-clients: dict  = {}
+clients:  dict = {}
 sessions: dict = {}
 
 _http_client = None
@@ -379,22 +380,17 @@ async def process_rescue(room_code: str, rescuer_uid: str, target_uid: str):
 
 
 # ================================================================
-# 룸 세션 생성 (RTDB 방 데이터 기반)
+# 룸 세션 생성
 # ================================================================
 async def create_game_session(room_code: str, room_data: dict):
-    """
-    RTDB의 방 데이터를 읽어 서버 인메모리 세션을 생성한다.
-    호스트가 게임 시작 버튼을 누를 때 WS t=start_game 으로 호출됨.
-    """
     if room_code in sessions:
         print(f"[Session] {room_code} 이미 존재", flush=True)
-        return
+        return sessions[room_code]
 
     players_data = room_data.get("players", {})
     host_uid     = room_data.get("hostId", "")
     max_players  = room_data.get("maxPlayers", 4)
 
-    # 플레이어 목록: 실제 유저 + AI
     real_uids = []
     ai_uids   = []
     for uid, pinfo in players_data.items():
@@ -403,17 +399,17 @@ async def create_game_session(room_code: str, room_data: dict):
         else:
             real_uids.append(uid)
 
-    # 팀 배정: 절반씩 나눔 (호스트는 항상 레드)
-    all_uids = real_uids + ai_uids
-    half     = max(1, len(all_uids) // 2)
+    # 팀 배정: 호스트 레드팀 고정, 나머지 절반씩
+    all_uids  = real_uids + ai_uids
+    half      = max(1, len(all_uids) // 2)
     team_red  = all_uids[:half]
     team_blue = all_uids[half:]
 
     sel_map = random.choice(MAPS)
 
-    # AI 플레이어 초기화
-    ai_players  = {}
-    ai_weapons  = {}
+    # AI 초기 배치
+    ai_players = {}
+    ai_weapons = {}
     red_idx = 0; blue_idx = 0
 
     for uid in ai_uids:
@@ -443,9 +439,9 @@ async def create_game_session(room_code: str, room_data: dict):
     sessions[room_code] = {
         "expected":        set(real_uids),
         "connected":       set(),
-        "players":         ai_players,       # AI는 미리 채워둠, 실제 유저는 j 때 추가
+        "players":         ai_players,
         "weapons":         dict(ai_weapons),
-        "weapon_selected": set(ai_uids),     # AI는 이미 선택된 것으로 처리
+        "weapon_selected": set(ai_uids),   # AI는 이미 선택 완료
         "map_id":          sel_map,
         "team_red":        team_red,
         "team_blue":       team_blue,
@@ -461,21 +457,19 @@ async def create_game_session(room_code: str, room_data: dict):
           f"real={len(real_uids)} AI={len(ai_uids)} "
           f"RED={team_red} BLUE={team_blue}", flush=True)
 
-    # RTDB에 gameStatus = starting 기록
+    # RTDB에 gameStatus = starting + 팀 정보 기록
     await rtdb_patch(f"rooms/{room_code}", {
         "gameStatus": "starting",
-        "serverSessionId": room_code,
+        "teamRed":    team_red,
+        "teamBlue":   team_blue,
+        "mapId":      sel_map,
     })
 
-    # 세션 타임아웃 감시
     asyncio.create_task(_session_timeout_watch(room_code))
-
     return sessions[room_code]
 
 
 async def _session_timeout_watch(room_code: str):
-    """실제 유저가 JOIN_TIMEOUT 안에 접속 안 하면 세션 정리"""
-    JOIN_TIMEOUT = 60.0
     await asyncio.sleep(JOIN_TIMEOUT)
     if room_code not in sessions: return
     s = sessions[room_code]
@@ -496,8 +490,9 @@ async def _cancel_session(room_code: str):
 async def check_all_weapons_selected(room_code: str):
     if room_code not in sessions: return
     s = sessions[room_code]
-    # 실제 유저 전원 + AI(이미 처리됨) 선택 완료 여부
-    if s["expected"] != s["weapon_selected"]: return
+    # expected = 실제 유저만, AI는 weapon_selected에 이미 포함
+    real_selected = s["weapon_selected"].intersection(s["expected"])
+    if real_selected != s["expected"]: return
     s["status"] = "in_game"
     print(f"[Weapon] {room_code} 전원 선택 → 게임 시작", flush=True)
     await broadcast(room_code, {
@@ -508,7 +503,6 @@ async def check_all_weapons_selected(room_code: str):
         "team_red":  s["team_red"],
         "team_blue": s["team_blue"],
     })
-    # RTDB 상태 업데이트
     await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "playing"})
     asyncio.create_task(sync_loop(room_code))
     asyncio.create_task(run_ai_loop(room_code, sessions, broadcast, ko_timer, AI_TICK_RATE))
@@ -518,12 +512,11 @@ async def check_all_weapons_selected(room_code: str):
 # HTTP 엔드포인트
 # ================================================================
 
-# ── 룸 시작 (호스트 전용 HTTP 트리거, WS로도 가능)
 @app.post("/room/start")
 async def http_room_start(request: Request):
     """
-    Godot 클라이언트가 직접 호출 가능한 게임 시작 트리거.
-    body: { "room_code": "ABCDEF", "host_uid": "...", "room_data": {...} }
+    PartyManager.request_game_start() 에서 호출.
+    body: { "room_code": "ABCDE1", "host_uid": "...", "room_data": {...} }
     """
     try:
         body = await request.json()
@@ -537,18 +530,19 @@ async def http_room_start(request: Request):
     if not room_code:
         return JSONResponse({"ok": False, "error": "room_code required"}, status_code=400)
 
-    # 이미 세션 있으면 중복 방지
+    # 이미 세션 존재 → 중복 방지
     if room_code in sessions:
         s = sessions[room_code]
         return JSONResponse({
-            "ok": True,
+            "ok":            True,
             "already_exists": True,
-            "status": s["status"],
-            "team_red": s["team_red"],
-            "team_blue": s["team_blue"],
+            "status":        s["status"],
+            "team_red":      s["team_red"],
+            "team_blue":     s["team_blue"],
+            "map_id":        s["map_id"],
         })
 
-    # RTDB에서 방 데이터 가져오기 (room_data가 없을 경우)
+    # room_data가 없으면 RTDB에서 읽기
     if not room_data:
         room_data = await rtdb_get(f"rooms/{room_code}")
         if not room_data:
@@ -607,11 +601,11 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
             t = msg.get("t", "")
 
-            # ── 게임 참가 (룸 코드 + 유저 ID)
+            # ── 게임 참가
             if t == "j":
                 uid       = msg.get("u", "")
                 room_code = msg.get("room_code", "").upper().strip()
-                team_hint = msg.get("tm", "")   # 클라이언트가 알고 있는 팀 (옵션)
+                team_hint = msg.get("tm", "")
 
                 if not room_code or room_code not in sessions:
                     await ws.send_text(json.dumps({"t": "f", "r": "no_session"}))
@@ -649,7 +643,7 @@ async def websocket_endpoint(ws: WebSocket):
                 }
                 s["connected"].add(uid)
 
-                # 스폰 위치 결정
+                # 스폰 위치
                 is_reconnect = uid in s["players"] and not s["players"][uid].get("disconnected", True)
                 if is_reconnect:
                     p = s["players"][uid]
@@ -657,14 +651,14 @@ async def websocket_endpoint(ws: WebSocket):
                     spawn = {"x": p["x"], "y": p["y"], "z": p["z"],
                              "ry": p["ry"], "an": "idle"}
                 else:
-                    idx = len([u for u in s["team_red"] if u in s["connected"]]) - 1 \
-                          if team == "r" else \
-                          len([u for u in s["team_blue"] if u in s["connected"]]) - 1
+                    red_cnt  = len([u for u in s["team_red"]  if u in s["connected"]])
+                    blue_cnt = len([u for u in s["team_blue"] if u in s["connected"]])
+                    idx = (red_cnt - 1) if team == "r" else (blue_cnt - 1)
                     if team == "r":
                         spawn = {"x": -10.0, "y": 0.5,
-                                 "z": float(max(idx, 0) * 2), "ry": 0.0, "an": "idle"}
+                                 "z": float(max(idx, 0) * 2), "ry": 0.0,  "an": "idle"}
                     else:
-                        spawn = {"x": 10.0, "y": 0.5,
+                        spawn = {"x": 10.0,  "y": 0.5,
                                  "z": float(max(idx, 0) * 2), "ry": 3.14, "an": "idle"}
                     s["players"][uid] = {
                         "tm": team, "hp": 100, "ko": False, "penalty": False,
@@ -700,7 +694,7 @@ async def websocket_endpoint(ws: WebSocket):
                                  "sp": spawn, "cn": cn, "ex": ex},
                                 exclude=uid)
 
-                # 전원 접속 완료 시 게임 준비 알림
+                # 전원 접속 시 게임 준비 알림
                 if s["expected"] == s["connected"]:
                     await broadcast(room_code, {
                         "t":         "g",
@@ -740,10 +734,10 @@ async def websocket_endpoint(ws: WebSocket):
                 new_y = float(msg.get("y", 0.5))
                 new_z = float(msg.get("z", 0))
                 valid, pos = validate_move(uid, new_x, new_y, new_z)
-                p        = s["players"][uid]
-                p["x"]   = pos["x"]; p["y"] = pos["y"]; p["z"] = pos["z"]
-                p["ry"]  = msg.get("ry", p.get("ry", 0.0))
-                p["an"]  = msg.get("an", p.get("an", "idle"))
+                p       = s["players"][uid]
+                p["x"]  = pos["x"]; p["y"] = pos["y"]; p["z"] = pos["z"]
+                p["ry"] = msg.get("ry", p.get("ry", 0.0))
+                p["an"] = msg.get("an", p.get("an", "idle"))
                 clients[uid]["last_pos"]      = pos
                 clients[uid]["last_pos_time"] = time.time()
                 if not valid:
@@ -802,7 +796,7 @@ async def health_head():
 
 if __name__ == "__main__":
     for var, name in [(RTDB_SECRET, "RTDB_SECRET"),
-                      (REDIS_URL, "REDIS_URL"),
+                      (REDIS_URL,   "REDIS_URL"),
                       (REDIS_TOKEN, "REDIS_TOKEN")]:
         if not var:
             print(f"[Server] 경고: {name} 없음!", flush=True)
