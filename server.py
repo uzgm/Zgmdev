@@ -1,4 +1,10 @@
-import asyncio, json, os, time, random, math
+"""
+mafia_server.py — 마피아 권위형 서버
+- Redis (Upstash): 게임 상태 저장 (역할/투표/생존 등)
+- RTDB: 방 목록 표시용 (gameStatus 반영만)
+- WebSocket /ws/mafia: 실시간 페이즈/투표/채팅 전체 관리
+"""
+import asyncio, json, os, random, time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response, JSONResponse
@@ -11,166 +17,820 @@ except ImportError:
     _USE_HTTPX = False
     print("[Warning] httpx 없음 → urllib fallback", flush=True)
 
-from ai_manager import run_ai_loop, WEAPON_STATS as _AI_WEAPON_STATS
-
-print("=== 서버 시작 (룸 기반) ===", flush=True)
-
 RTDB_URL    = "https://zgm-base-default-rtdb.asia-southeast1.firebasedatabase.app/"
 RTDB_SECRET = os.environ.get("RTDB_SECRET", "")
 REDIS_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 WS_PORT     = int(os.environ.get("PORT", 7860))
-WS_PING_INTERVAL = 20
 
-# 게임 설정
-SESSION_TTL           = 600
-SYNC_TICK_RATE        = 10
-AI_TICK_RATE          = 10
-MAX_MOVE_SPEED        = 6.5
-KO_REVIVE_TIME        = 20.0
-RESCUE_WINDOW         = 10.0
-WEAPON_SELECT_TIMEOUT = 30.0
-JOIN_TIMEOUT          = 60.0
+PHASE_TIMES = {
+    "meet":    10,
+    "night":   25,
+    "morning": 15,
+    "day":     35,
+    "vote":    25,
+}
+MAX_ROUNDS  = 10
+SESSION_TTL = 3600  # Redis TTL (초)
 
-MAP_MIN_X = -16.0; MAP_MAX_X = 16.0
-MAP_MIN_Z = -9.0;  MAP_MAX_Z = 9.0
-
-WEAPON_STATS = _AI_WEAPON_STATS
-WEAPONS      = list(WEAPON_STATS.keys())
-MAPS         = ["default"]
-
-print(f"=== httpx: {_USE_HTTPX} | RTDB_SECRET 길이: {len(RTDB_SECRET)} ===", flush=True)
+print(f"=== 마피아 서버 | httpx={_USE_HTTPX} | redis={bool(REDIS_URL)} ===", flush=True)
 
 # ================================================================
-# 전역 상태
-# clients[uid]  = { ws, room_code, last_pos, last_pos_time, last_attack_time }
+# 전역
 # sessions[room_code] = {
-#   players, weapons, weapon_selected, connected, expected,
-#   status, host_uid, max_players, room_name, created_at, ai_uids,
-#   team_red, team_blue, map_id
+#   "players": { uid: { ws, nickname, tag, isHost, isAI } },
+#   "phase_task": asyncio.Task | None,
+#   "status":  "waiting" | "playing" | "ended"
 # }
+# 게임 상태(역할/투표/생존)는 Redis 에 저장
 # ================================================================
-clients:  dict = {}
 sessions: dict = {}
-
-_http_client = None
+_http_client   = None
 
 
 # ================================================================
 # HTTP 헬퍼
 # ================================================================
-async def _get(url: str):
+async def _http_get(url: str):
     try:
         if _USE_HTTPX and _http_client:
             r = await _http_client.get(url)
             return r.json() if r.status_code == 200 else None
-        else:
-            import urllib.request as ur
-            loop = asyncio.get_event_loop()
-            raw  = await loop.run_in_executor(None, lambda: ur.urlopen(url, timeout=5).read())
-            return json.loads(raw)
+        import urllib.request as ur
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, lambda: ur.urlopen(url, timeout=5).read())
+        return json.loads(raw)
     except Exception as e:
-        print(f"[HTTP GET 오류] {type(e).__name__}: {e}", flush=True)
-        return None
+        print(f"[GET 오류] {e}", flush=True); return None
 
-async def _put(url: str, data) -> bool:
+async def _http_put(url: str, data) -> bool:
     try:
         body = json.dumps(data)
         if _USE_HTTPX and _http_client:
             r = await _http_client.put(url, content=body,
                                         headers={"Content-Type": "application/json"})
             return r.status_code == 200
-        else:
-            import urllib.request as ur
-            loop = asyncio.get_event_loop()
-            req  = ur.Request(url, data=body.encode(),
-                              headers={"Content-Type": "application/json"}, method="PUT")
-            await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
-            return True
+        import urllib.request as ur
+        loop = asyncio.get_event_loop()
+        req = ur.Request(url, data=body.encode(),
+                         headers={"Content-Type": "application/json"}, method="PUT")
+        await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
+        return True
     except Exception as e:
-        print(f"[HTTP PUT 오류] {type(e).__name__}: {e}", flush=True)
-        return False
+        print(f"[PUT 오류] {e}", flush=True); return False
 
-async def _patch(url: str, data) -> bool:
+async def _http_patch(url: str, data) -> bool:
     try:
         body = json.dumps(data)
         if _USE_HTTPX and _http_client:
             r = await _http_client.patch(url, content=body,
                                           headers={"Content-Type": "application/json"})
             return r.status_code == 200
-        else:
-            import urllib.request as ur
-            loop = asyncio.get_event_loop()
-            req  = ur.Request(url, data=body.encode(),
-                              headers={"Content-Type": "application/json"}, method="PATCH")
-            await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
-            return True
+        import urllib.request as ur
+        loop = asyncio.get_event_loop()
+        req = ur.Request(url, data=body.encode(),
+                         headers={"Content-Type": "application/json"}, method="PATCH")
+        await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
+        return True
     except Exception as e:
-        print(f"[HTTP PATCH 오류] {type(e).__name__}: {e}", flush=True)
-        return False
+        print(f"[PATCH 오류] {e}", flush=True); return False
 
-async def _delete(url: str):
+async def _http_delete(url: str):
     try:
         if _USE_HTTPX and _http_client:
             await _http_client.delete(url)
         else:
             import urllib.request as ur
             loop = asyncio.get_event_loop()
-            req  = ur.Request(url, method="DELETE")
+            req = ur.Request(url, method="DELETE")
             await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
     except Exception as e:
-        print(f"[HTTP DELETE 오류] {type(e).__name__}: {e}", flush=True)
+        print(f"[DELETE 오류] {e}", flush=True)
+
+def _rtdb(path): return f"{RTDB_URL}{path}.json?auth={RTDB_SECRET}"
+async def rtdb_get(path):      return await _http_get(_rtdb(path))
+async def rtdb_patch(path, d): return await _http_patch(_rtdb(path), d)
 
 
 # ================================================================
-# Redis 헬퍼
+# Redis 헬퍼 (Upstash REST)
 # ================================================================
 def _redis_headers():
     return {"Authorization": f"Bearer {REDIS_TOKEN}", "Content-Type": "application/json"}
 
-async def redis_set(key, value, ex=SESSION_TTL) -> bool:
-    if not REDIS_URL: return False
+async def _redis_cmd(*args):
+    if not REDIS_URL: return None
     try:
-        body = json.dumps(["SET", key, json.dumps(value), "EX", ex])
+        body = json.dumps(list(args))
         if _USE_HTTPX and _http_client:
             r = await _http_client.post(REDIS_URL, content=body, headers=_redis_headers())
-            return r.json().get("result") == "OK"
-        else:
-            import urllib.request as ur
-            loop = asyncio.get_event_loop()
-            req  = ur.Request(REDIS_URL, data=body.encode(),
-                              headers=_redis_headers(), method="POST")
-            raw  = await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5).read())
-            return json.loads(raw).get("result") == "OK"
+            return r.json().get("result")
+        import urllib.request as ur
+        loop = asyncio.get_event_loop()
+        req = ur.Request(REDIS_URL, data=body.encode(),
+                         headers=_redis_headers(), method="POST")
+        raw = await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5).read())
+        return json.loads(raw).get("result")
     except Exception as e:
-        print(f"[Redis SET 오류] {type(e).__name__}: {e}", flush=True)
-        return False
+        print(f"[Redis 오류] {e}", flush=True); return None
 
-async def redis_del(key):
-    if not REDIS_URL: return
+async def redis_set(key: str, value: dict, ex: int = SESSION_TTL):
+    return await _redis_cmd("SET", key, json.dumps(value), "EX", ex)
+
+async def redis_get(key: str) -> dict | None:
+    raw = await _redis_cmd("GET", key)
+    if raw is None: return None
+    try: return json.loads(raw)
+    except: return None
+
+async def redis_del(key: str):
+    await _redis_cmd("DEL", key)
+
+def _gs_key(room_code: str) -> str:
+    return f"mafia:gs:{room_code}"
+
+
+# ================================================================
+# 게임 상태 로드/저장
+# ================================================================
+async def load_gs(room_code: str) -> dict:
+    gs = await redis_get(_gs_key(room_code))
+    return gs or {}
+
+async def save_gs(room_code: str, gs: dict):
+    await redis_set(_gs_key(room_code), gs)
+
+
+# ================================================================
+# 역할 계산
+# ================================================================
+def calc_roles(total: int) -> dict:
+    c = {k: 0 for k in ["mafia","doctor","police","citizen","mayor",
+                         "doktor_gil","seer","lawyer","anchor","gamedev"]}
+    if total <= 4:
+        c["mafia"] = 1; c["police"] = 1; c["citizen"] = total - 2
+    elif total <= 6:
+        c["mafia"] = 1; c["doctor"] = 1; c["police"] = 1
+        c["seer"] = 1; c["citizen"] = total - 4
+    elif total <= 8:
+        c["mafia"] = 2; c["doctor"] = 1; c["police"] = 1
+        c["seer"] = 1; c["mayor"] = 1; c["citizen"] = total - 6
+    elif total == 9:
+        c["mafia"] = 2; c["doctor"] = 1; c["police"] = 1
+        c["seer"] = 1; c["mayor"] = 1; c["anchor"] = 1; c["citizen"] = total - 7
+    elif total == 10:
+        c["mafia"] = 2; c["doctor"] = 1; c["police"] = 1; c["seer"] = 1
+        c["mayor"] = 1; c["lawyer"] = 1; c["doktor_gil"] = 1
+        c["anchor"] = 1; c["citizen"] = total - 9
+    elif total == 11:
+        c["mafia"] = 2; c["doctor"] = 1; c["police"] = 1; c["seer"] = 1
+        c["mayor"] = 1; c["lawyer"] = 1; c["doktor_gil"] = 1
+        c["anchor"] = 1; c["gamedev"] = 1; c["citizen"] = total - 10
+    else:
+        c["mafia"] = 3; c["doctor"] = 1; c["police"] = 1; c["seer"] = 1
+        c["mayor"] = 1; c["lawyer"] = 1; c["doktor_gil"] = 1
+        c["anchor"] = 1; c["gamedev"] = 1; c["citizen"] = total - 11
+    return c
+
+
+# ================================================================
+# 브로드캐스트
+# ================================================================
+async def broadcast(room_code: str, msg: dict, exclude: str = None):
+    if room_code not in sessions: return
+    data = json.dumps(msg, ensure_ascii=False)
+    async def _send(uid, p):
+        if p.get("isAI"): return
+        try: await p["ws"].send_text(data)
+        except: pass
+    await asyncio.gather(*[
+        _send(uid, p)
+        for uid, p in list(sessions[room_code]["players"].items())
+        if uid != exclude
+    ], return_exceptions=True)
+
+async def send_to(room_code: str, uid: str, msg: dict):
+    p = sessions.get(room_code, {}).get("players", {}).get(uid)
+    if not p or p.get("isAI"): return
+    try: await p["ws"].send_text(json.dumps(msg, ensure_ascii=False))
+    except: pass
+
+
+# ================================================================
+# 세션 초기화
+# ================================================================
+async def init_session(room_code: str, room_data: dict) -> dict:
+    pdata    = room_data.get("players", {})
+    host_uid = room_data.get("hostId", "")
+    uids     = list(pdata.keys())
+    total    = len(uids)
+
+    # 역할 배정
+    role_counts = calc_roles(total)
+    role_list   = []
+    for role, cnt in role_counts.items():
+        role_list.extend([role] * cnt)
+    shuffled_uids = uids[:]
+    random.shuffle(shuffled_uids)
+    random.shuffle(role_list)
+    roles = {uid: role_list[i] for i, uid in enumerate(shuffled_uids)}
+
+    gs = {
+        "phase": "meet",
+        "day":   1,
+        "roles": roles,
+        "alive": {uid: True for uid in uids},
+        "host_uid": host_uid,
+        "players": {
+            uid: {
+                "nickname": pdata[uid].get("nickname", "?"),
+                "tag":      pdata[uid].get("tag", "0000"),
+                "isAI":     pdata[uid].get("isAI", False),
+                "isHost":   pdata[uid].get("isHost", False),
+            } for uid in uids
+        },
+        # 밤 행동 (매 밤 초기화)
+        "night_votes":        {},
+        "doctor_protect":     {},
+        "police_investigate": {},
+        "doktor_kill":        {},
+        "seer_divine":        {},
+        "lawyer_block":       {},
+        "anchor_target":      {},
+        "gamedev_teach":      {},
+        # 낮 투표
+        "day_votes": {},
+        # 상태
+        "tie_pool":                [],
+        "consecutive_ties":        0,
+        "anchor_translate_target": "",
+        "morning_result":          {},
+    }
+
+    await save_gs(room_code, gs)
+
+    sessions[room_code] = {
+        "players":    {},
+        "phase_task": None,
+        "status":     "waiting",
+    }
+
+    print(f"[Init] {room_code} | {total}명 | {role_counts}", flush=True)
+    return gs
+
+
+# ================================================================
+# 밤 행동 처리
+# ================================================================
+async def process_night(room_code: str, gs: dict) -> dict:
+    roles      = gs["roles"]
+    alive      = gs["alive"]
+    alive_list = [u for u, a in alive.items() if a]
+
+    # 변호사 봉쇄
+    lawyer_blocked = list(gs["lawyer_block"].values())
+
+    # 게임개발자 처리
+    gd_blocked   = []
+    gd_killed    = ""
+    gd_csharp_t  = ""
+    gd_results   = {}
+    for dev_id, data in gs["gamedev_teach"].items():
+        if dev_id in lawyer_blocked: continue
+        if roles.get(dev_id) != "gamedev": continue
+        tgt  = data.get("target", "")
+        lang = data.get("lang", "python")
+        if not tgt: continue
+        gd_results[dev_id] = {"target": tgt, "lang": lang}
+        if lang == "python":
+            if tgt not in gd_blocked: gd_blocked.append(tgt)
+        elif lang == "cpp":
+            gd_killed = tgt
+            if tgt not in gd_blocked: gd_blocked.append(tgt)
+        elif lang == "csharp":
+            gd_csharp_t = tgt
+            if tgt in alive_list:
+                if tgt not in gd_blocked: gd_blocked.append(tgt)
+
+    # 마피아 킬
+    mafia_votes = {
+        v: t for v, t in gs["night_votes"].items()
+        if v not in lawyer_blocked and v not in gd_blocked
+        and roles.get(v) == "mafia" and alive.get(v) and alive.get(t)
+    }
+    mafia_target = ""
+    if mafia_votes:
+        count = {}
+        for t in mafia_votes.values():
+            count[t] = count.get(t, 0) + 1
+        mx    = max(count.values())
+        cands = [t for t, c in count.items() if c == mx]
+        mafia_target = random.choice(cands)
+
+    # 의사 보호
+    protected = []
+    for pid, tgt in gs["doctor_protect"].items():
+        if pid in lawyer_blocked or pid in gd_blocked: continue
+        if tgt not in protected: protected.append(tgt)
+
+    # 닥터길유
+    doktor_target = ""
+    for pid, tgt in gs["doktor_kill"].items():
+        if pid in lawyer_blocked or pid in gd_blocked: continue
+        if roles.get(pid) == "doktor_gil":
+            doktor_target = tgt; break
+
+    # 점쟁이
+    seer_results = {}
+    for seer_id, tgt in gs["seer_divine"].items():
+        if seer_id in lawyer_blocked or seer_id in gd_blocked: continue
+        if roles.get(seer_id) != "seer": continue
+        real = roles.get(tgt, "citizen")
+        shown = real if random.random() < 0.7 else (
+            random.choice(["citizen","police","doctor","mayor"]) if real == "mafia" else "mafia"
+        )
+        seer_results[seer_id] = {"target": tgt, "shown_role": shown}
+
+    # 스토커
+    police_results = {}
+    for cop_id, tgt in gs["police_investigate"].items():
+        if cop_id in lawyer_blocked or cop_id in gd_blocked: continue
+        if roles.get(cop_id) != "police": continue
+        police_results[cop_id] = {
+            "target": tgt,
+            "result": "mafia" if roles.get(tgt) == "mafia" else "citizen"
+        }
+
+    # 앵커
+    anchor_tgt = ""
+    for pid, tgt in gs["anchor_target"].items():
+        if pid in lawyer_blocked or pid in gd_blocked: continue
+        if roles.get(pid) == "anchor" and alive.get(tgt):
+            anchor_tgt = tgt; break
+
+    # 사망 처리
+    actual_elim = ""
+    if mafia_target and mafia_target not in protected:
+        alive[mafia_target] = False; actual_elim = mafia_target
+
+    actual_doktor = ""
+    if doktor_target and doktor_target != actual_elim:
+        alive[doktor_target] = False; actual_doktor = doktor_target
+
+    actual_gd_dead = ""
+    if gd_killed and gd_killed not in (actual_elim, actual_doktor):
+        alive[gd_killed] = False; actual_gd_dead = gd_killed
+
+    # C# 은폐
+    show_elim = actual_elim
+    if gd_csharp_t:
+        if gd_csharp_t not in alive_list or gd_csharp_t == actual_elim:
+            show_elim = ""
+
+    mr = {
+        "round":                 gs["day"],
+        "eliminated":            show_elim,
+        "eliminated_real":       actual_elim,
+        "protected":             mafia_target != "" and actual_elim == "",
+        "doktor_killed":         actual_doktor,
+        "gamedev_killed":        actual_gd_dead,
+        "lawyer_blocked":        lawyer_blocked,
+        "gamedev_blocked":       gd_blocked,
+        "gamedev_teach_results": gd_results,
+        "gamedev_csharp_target": gd_csharp_t,
+        "seer_results":          seer_results,
+        "police_results":        police_results,
+        "anchor_target":         anchor_tgt,
+    }
+
+    gs["alive"]                    = alive
+    gs["morning_result"]           = mr
+    gs["anchor_translate_target"]  = anchor_tgt
+    # 밤 행동 초기화
+    for k in ["night_votes","doctor_protect","police_investigate",
+              "doktor_kill","seer_divine","lawyer_block","anchor_target","gamedev_teach"]:
+        gs[k] = {}
+
+    return mr
+
+
+# ================================================================
+# 낮 투표 처리
+# ================================================================
+async def process_votes(room_code: str, gs: dict) -> str:
+    roles      = gs["roles"]
+    alive_list = [u for u, a in gs["alive"].items() if a]
+    votes      = gs["day_votes"]
+
+    count: dict = {}
+    for voter, tgt in votes.items():
+        if not gs["alive"].get(tgt): continue
+        w = 2 if roles.get(voter) == "mayor" else 1
+        count[tgt] = count.get(tgt, 0) + w
+
+    eliminated = ""
+    if count:
+        mx    = max(count.values())
+        cands = [t for t, c in count.items() if c == mx]
+        if len(cands) == 1:
+            eliminated = cands[0]
+            gs["consecutive_ties"] = 0; gs["tie_pool"] = []
+        else:
+            for c in cands:
+                if c not in gs["tie_pool"]: gs["tie_pool"].append(c)
+            gs["consecutive_ties"] += 1
+            valid = [c for c in gs["tie_pool"] if c in alive_list]
+            if valid:
+                eliminated = random.choice(valid)
+                gs["consecutive_ties"] = 0; gs["tie_pool"] = []
+    else:
+        if alive_list: eliminated = random.choice(alive_list)
+
+    if eliminated:
+        gs["alive"][eliminated] = False
+    gs["day_votes"] = {}
+    return eliminated
+
+
+# ================================================================
+# 승리 체크
+# ================================================================
+def check_win(gs: dict) -> str | None:
+    roles = gs["roles"]
+    alive = gs["alive"]
+    m = sum(1 for u, a in alive.items() if a and roles.get(u) == "mafia")
+    c = sum(1 for u, a in alive.items() if a and roles.get(u) != "mafia")
+    if m == 0:   return "citizen"
+    if m >= c:   return "mafia"
+    return None
+
+
+# ================================================================
+# 페이즈 루프 (권위형 타이머)
+# ================================================================
+async def phase_loop(room_code: str):
+    print(f"[Phase] {room_code} 루프 시작", flush=True)
     try:
-        body = json.dumps(["DEL", key])
-        if _USE_HTTPX and _http_client:
-            await _http_client.post(REDIS_URL, content=body, headers=_redis_headers())
-        else:
-            import urllib.request as ur
-            loop = asyncio.get_event_loop()
-            req  = ur.Request(REDIS_URL, data=body.encode(),
-                              headers=_redis_headers(), method="POST")
-            await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
+        while room_code in sessions and sessions[room_code]["status"] == "playing":
+            gs    = await load_gs(room_code)
+            phase = gs.get("phase", "meet")
+            wait  = PHASE_TIMES.get(phase, 10)
+
+            # 페이즈 시작 알림
+            await broadcast(room_code, {
+                "t":     "phase",
+                "phase": phase,
+                "day":   gs.get("day", 1),
+                "time":  wait,
+            })
+
+            # 1초 틱
+            for rem in range(wait, 0, -1):
+                if room_code not in sessions: return
+                await asyncio.sleep(1)
+                if rem % 5 == 0 or rem <= 5:
+                    await broadcast(room_code, {"t": "tick", "time": rem - 1})
+
+            if room_code not in sessions: return
+            gs = await load_gs(room_code)
+
+            # ── 페이즈 전환 ──────────────────────────────────
+            if phase == "meet":
+                gs["phase"] = "night"
+                await save_gs(room_code, gs)
+
+            elif phase == "night":
+                mr = await process_night(room_code, gs)
+                gs["phase"] = "morning"
+                await save_gs(room_code, gs)
+
+                # morning 브로드캐스트 + 슬립 (별도 루프 반복 없이 인라인)
+                await broadcast(room_code, {
+                    "t":      "phase",
+                    "phase":  "morning",
+                    "day":    gs["day"],
+                    "time":   PHASE_TIMES["morning"],
+                    "result": mr,
+                })
+                for rem in range(PHASE_TIMES["morning"], 0, -1):
+                    if room_code not in sessions: return
+                    await asyncio.sleep(1)
+                    if rem % 5 == 0 or rem <= 5:
+                        await broadcast(room_code, {"t": "tick", "time": rem - 1})
+
+                gs = await load_gs(room_code)
+                winner = check_win(gs)
+                if winner or gs["day"] >= MAX_ROUNDS:
+                    await end_game(room_code, gs, winner or "citizen", "elimination")
+                    return
+                gs["phase"] = "day"
+                await save_gs(room_code, gs)
+
+            elif phase == "day":
+                gs["phase"] = "vote"
+                await save_gs(room_code, gs)
+
+            elif phase == "vote":
+                elim = await process_votes(room_code, gs)
+                await broadcast(room_code, {
+                    "t":          "vote_result",
+                    "eliminated": elim,
+                    "alive":      gs["alive"],
+                    "tie_pool":   gs["tie_pool"],
+                })
+                winner = check_win(gs)
+                if winner or gs["day"] >= MAX_ROUNDS:
+                    await end_game(room_code, gs, winner or "citizen", "vote")
+                    return
+                gs["day"]  += 1
+                gs["phase"] = "night"
+                await save_gs(room_code, gs)
+
+    except asyncio.CancelledError:
+        print(f"[Phase] {room_code} 취소", flush=True)
     except Exception as e:
-        print(f"[Redis DEL 오류] {type(e).__name__}: {e}", flush=True)
+        print(f"[Phase] {room_code} 오류: {e}", flush=True)
+
+
+async def end_game(room_code: str, gs: dict, winner: str, reason: str):
+    gs["phase"]  = "result"
+    gs["winner"] = winner
+    await save_gs(room_code, gs)
+    await broadcast(room_code, {
+        "t":      "game_result",
+        "winner": winner,
+        "reason": reason,
+        "roles":  gs["roles"],
+        "alive":  gs["alive"],
+        "day":    gs["day"],
+    })
+    if room_code in sessions:
+        sessions[room_code]["status"] = "ended"
+    await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "ended"})
+    print(f"[End] {room_code} winner={winner}", flush=True)
 
 
 # ================================================================
-# RTDB 헬퍼
+# HTTP: 게임 시작
 # ================================================================
-def _rtdb(path): return f"{RTDB_URL}{path}.json?auth={RTDB_SECRET}"
+@app.post("/room/start")
+async def http_room_start(request: Request):
+    """
+    RoomWaiting.gd 호스트가 게임 시작 버튼 누를 때 호출.
+    body: { room_code, host_uid, room_data? }
+    """
+    try: body = await request.json()
+    except: return JSONResponse({"ok": False, "error": "invalid json"}, 400)
 
-async def rtdb_get(path):      return await _get(_rtdb(path))
-async def rtdb_put(path, d):   return await _put(_rtdb(path), d)
-async def rtdb_patch(path, d): return await _patch(_rtdb(path), d)
-async def rtdb_delete(path):   await _delete(_rtdb(path))
+    room_code = body.get("room_code", "").upper().strip()
+    host_uid  = body.get("host_uid", "")
+    room_data = body.get("room_data", {})
+
+    if not room_code:
+        return JSONResponse({"ok": False, "error": "room_code required"}, 400)
+
+    if room_code in sessions and sessions[room_code]["status"] == "playing":
+        return JSONResponse({"ok": True, "already": True})
+
+    if not room_data:
+        room_data = await rtdb_get(f"rooms/{room_code}")
+        if not room_data:
+            return JSONResponse({"ok": False, "error": "room not found"}, 404)
+
+    if room_data.get("hostId", "") != host_uid:
+        return JSONResponse({"ok": False, "error": "not host"}, 403)
+
+    await init_session(room_code, room_data)
+    await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "playing"})
+
+    print(f"[HTTP] 시작 room={room_code} host={host_uid}", flush=True)
+    return JSONResponse({"ok": True, "room_code": room_code})
+
+
+@app.get("/room/{room_code}/state")
+async def http_room_state(room_code: str):
+    gs = await load_gs(room_code.upper())
+    if not gs:
+        return JSONResponse({"ok": False, "exists": False})
+    return JSONResponse({
+        "ok":    True,
+        "phase": gs.get("phase"),
+        "day":   gs.get("day", 1),
+        "alive": gs.get("alive", {}),
+    })
+
+
+# ================================================================
+# WebSocket /ws/mafia
+# ================================================================
+@app.websocket("/ws/mafia")
+async def ws_mafia(ws: WebSocket):
+    await ws.accept()
+    uid       = None
+    room_code = None
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try: msg = json.loads(raw)
+            except: continue
+            t = msg.get("t", "")
+
+            # ── 참가 ─────────────────────────────────────────
+            if t == "join":
+                uid       = msg.get("uid", "")
+                room_code = msg.get("room_code", "").upper().strip()
+
+                if room_code not in sessions:
+                    await ws.send_text(json.dumps({"t": "error", "r": "no_session"}))
+                    continue
+
+                gs = await load_gs(room_code)
+                if uid not in gs.get("players", {}):
+                    await ws.send_text(json.dumps({"t": "error", "r": "not_in_room"}))
+                    continue
+
+                # WS 등록
+                pinfo = gs["players"][uid]
+                sessions[room_code]["players"][uid] = {
+                    "ws":       ws,
+                    "nickname": pinfo["nickname"],
+                    "tag":      pinfo["tag"],
+                    "isHost":   pinfo.get("isHost", False),
+                    "isAI":     pinfo.get("isAI", False),
+                }
+
+                my_role = gs["roles"].get(uid, "citizen")
+
+                # 현재 상태 전송 (재접속 포함)
+                await ws.send_text(json.dumps({
+                    "t":         "joined",
+                    "uid":       uid,
+                    "role":      my_role,
+                    "phase":     gs["phase"],
+                    "day":       gs["day"],
+                    "alive":     gs["alive"],
+                    "players":   gs["players"],
+                    "tie_pool":  gs["tie_pool"],
+                    "mafia_team": {
+                        pid: r for pid, r in gs["roles"].items() if r == "mafia"
+                    } if my_role in ("mafia", "anchor") else {},
+                }))
+
+                # 전원 접속 확인 → 페이즈 루프 시작
+                s           = sessions[room_code]
+                real_uids   = [u for u, p in gs["players"].items() if not p.get("isAI")]
+                connected   = [u for u, p in s["players"].items() if not p.get("isAI")]
+                if set(real_uids) == set(connected) and s["status"] == "waiting":
+                    s["status"] = "playing"
+                    if s.get("phase_task"): s["phase_task"].cancel()
+                    s["phase_task"] = asyncio.create_task(phase_loop(room_code))
+                    print(f"[WS] {room_code} 전원 접속 → 루프 시작", flush=True)
+
+                await broadcast(room_code, {
+                    "t":  "player_joined",
+                    "uid": uid,
+                    "cn": len(connected),
+                    "ex": len(real_uids),
+                }, exclude=uid)
+
+            # ── 밤 행동 ──────────────────────────────────────
+            elif t == "night_action":
+                if not (uid and room_code and room_code in sessions): continue
+                gs     = await load_gs(room_code)
+                if not gs["alive"].get(uid): continue
+                if gs["phase"] != "night": continue
+
+                my_role = gs["roles"].get(uid, "")
+
+                # 봉쇄 체크
+                if uid in gs["lawyer_block"].values(): continue
+                gd_blocked = _calc_gd_blocked(gs)
+                if uid in gd_blocked: continue
+
+                action = msg.get("action", "")
+                target = msg.get("target", "")
+
+                field_map = {
+                    "mafia_kill":         ("night_votes",        "mafia"),
+                    "doctor_protect":     ("doctor_protect",     "doctor"),
+                    "police_investigate": ("police_investigate", "police"),
+                    "doktor_kill":        ("doktor_kill",        "doktor_gil"),
+                    "seer_divine":        ("seer_divine",        "seer"),
+                    "lawyer_block":       ("lawyer_block",       "lawyer"),
+                    "anchor_target":      ("anchor_target",      "anchor"),
+                }
+                if action in field_map:
+                    field, req_role = field_map[action]
+                    if my_role == req_role:
+                        gs[field][uid] = target
+                        await save_gs(room_code, gs)
+                        await ws.send_text(json.dumps({"t": "action_ok", "action": action}))
+
+                elif action == "gamedev_teach":
+                    if my_role == "gamedev":
+                        gs["gamedev_teach"][uid] = {
+                            "target": target,
+                            "lang":   msg.get("lang", "python")
+                        }
+                        await save_gs(room_code, gs)
+                        await ws.send_text(json.dumps({
+                            "t": "action_ok", "action": "gamedev_teach",
+                            "lang": msg.get("lang", "python")
+                        }))
+
+            # ── 낮 투표 ──────────────────────────────────────
+            elif t == "day_vote":
+                if not (uid and room_code and room_code in sessions): continue
+                gs = await load_gs(room_code)
+                if not gs["alive"].get(uid): continue
+                if gs["phase"] != "vote": continue
+                gs["day_votes"][uid] = msg.get("target", "")
+                await save_gs(room_code, gs)
+                await ws.send_text(json.dumps({"t": "vote_ok"}))
+
+            # ── 채팅 ─────────────────────────────────────────
+            elif t == "chat":
+                if not (uid and room_code and room_code in sessions): continue
+                gs      = await load_gs(room_code)
+                channel = msg.get("channel", "general")
+                text    = msg.get("text", "").strip()
+                if not text: continue
+
+                # 밤 일반채팅 차단
+                if gs["phase"] == "night" and channel == "general": continue
+
+                my_role = gs["roles"].get(uid, "")
+                if channel == "mafia" and my_role not in ("mafia", "anchor"): continue
+
+                # 앵커 강제 번역기
+                if channel == "general" and uid == gs.get("anchor_translate_target", ""):
+                    suffixes = [
+                        " (사실 난 마피아야 쿳소!)",
+                        " (오마에와 모우 신데이루)",
+                        " (I am the Mafia, actually)",
+                        " (브레드 킬러가 나야...사실...)",
+                        " [강제번역: 나는 마피아입니다]",
+                    ]
+                    text += random.choice(suffixes)
+
+                pinfo    = gs["players"].get(uid, {})
+                chat_msg = {
+                    "t":        "chat",
+                    "channel":  channel,
+                    "uid":      uid,
+                    "nickname": pinfo.get("nickname", "?"),
+                    "tag":      pinfo.get("tag", "0000"),
+                    "text":     text,
+                    "ts":       int(time.time() * 1000),
+                }
+                if channel == "general":
+                    await broadcast(room_code, chat_msg)
+                else:
+                    for pid, r in gs["roles"].items():
+                        if r in ("mafia", "anchor"):
+                            await send_to(room_code, pid, chat_msg)
+
+            # ── 감정 ─────────────────────────────────────────
+            elif t == "emotion":
+                if not (uid and room_code): continue
+                gs = await load_gs(room_code)
+                if not gs["alive"].get(uid): continue
+                await broadcast(room_code, {
+                    "t":       "emotion",
+                    "uid":     uid,
+                    "emotion": msg.get("emotion", ""),
+                }, exclude=uid)
+
+            # ── 핑 ───────────────────────────────────────────
+            elif t == "ping":
+                await ws.send_text(json.dumps({"t": "pong"}))
+
+            # ── 나가기 ───────────────────────────────────────
+            elif t == "leave":
+                break
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[WS 오류] uid={uid}: {e}", flush=True)
+    finally:
+        if uid and room_code and room_code in sessions:
+            sessions[room_code]["players"].pop(uid, None)
+            await broadcast(room_code, {"t": "player_left", "uid": uid})
+        print(f"[WS] 해제: {uid}", flush=True)
+
+
+# ================================================================
+# 유틸
+# ================================================================
+def _calc_gd_blocked(gs: dict) -> list:
+    blocked = []
+    for _, data in gs.get("gamedev_teach", {}).items():
+        tgt = data.get("target", "")
+        if tgt and tgt not in blocked:
+            blocked.append(tgt)
+    return blocked
 
 
 # ================================================================
@@ -181,7 +841,7 @@ async def lifespan(app: FastAPI):
     global _http_client
     if _USE_HTTPX:
         _http_client = httpx.AsyncClient(timeout=5.0)
-    print("[Startup] 룸 기반 서버 준비 완료", flush=True)
+    print("[Startup] 마피아 서버 준비 완료", flush=True)
     yield
     if _http_client:
         await _http_client.aclose()
@@ -190,603 +850,16 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ================================================================
-# 게임 로직 유틸
-# ================================================================
-def dist_2d(a: dict, b: dict) -> float:
-    return math.sqrt((a.get("x", 0) - b.get("x", 0))**2 +
-                     (a.get("z", 0) - b.get("z", 0))**2)
-
-def clamp_pos(x, z):
-    return max(MAP_MIN_X, min(MAP_MAX_X, x)), max(MAP_MIN_Z, min(MAP_MAX_Z, z))
-
-def validate_move(uid: str, new_x: float, new_y: float, new_z: float):
-    info = clients.get(uid)
-    if not info:
-        return True, {"x": new_x, "y": new_y, "z": new_z}
-    last_pos  = info.get("last_pos")
-    last_time = info.get("last_pos_time", time.time())
-    dt        = time.time() - last_time
-    if last_pos is None or dt <= 0:
-        return True, {"x": new_x, "y": new_y, "z": new_z}
-    dx = new_x - last_pos["x"]; dz = new_z - last_pos["z"]
-    speed = math.sqrt(dx*dx + dz*dz) / dt
-    if speed > MAX_MOVE_SPEED * 1.5:
-        print(f"[AntiCheat] {uid} 속도 위반 {speed:.1f}m/s", flush=True)
-        return False, last_pos
-    return True, {"x": new_x, "y": new_y, "z": new_z}
-
-def check_attack_cooldown(uid: str, weapon: str) -> bool:
-    info = clients.get(uid)
-    if not info: return False
-    cooldown = WEAPON_STATS.get(weapon, {}).get("cooldown", 1.0)
-    if time.time() - info.get("last_attack_time", 0) < cooldown * 0.85:
-        return False
-    info["last_attack_time"] = time.time()
-    return True
-
-
-# ================================================================
-# 브로드캐스트
-# ================================================================
-async def broadcast(room_code: str, msg: dict, exclude=None):
-    data    = json.dumps(msg, ensure_ascii=False)
-    targets = [(uid, info) for uid, info in list(clients.items())
-               if info.get("room_code") == room_code and uid != exclude]
-
-    async def _send(uid, info):
-        try:
-            await info["ws"].send_text(data)
-        except Exception:
-            await _cleanup_client(uid)
-
-    if targets:
-        await asyncio.gather(*[_send(uid, info) for uid, info in targets],
-                             return_exceptions=True)
-
-async def send_to(uid: str, msg: dict):
-    info = clients.get(uid)
-    if not info: return
-    try:
-        await info["ws"].send_text(json.dumps(msg, ensure_ascii=False))
-    except Exception:
-        await _cleanup_client(uid)
-
-async def _cleanup_client(uid: str):
-    info = clients.pop(uid, None)
-    if not info: return
-    room_code = info.get("room_code", "")
-    if room_code and room_code in sessions:
-        s = sessions[room_code]
-        s["connected"].discard(uid)
-        p = s["players"].get(uid)
-        if p: p["disconnected"] = True
-        if s["status"] == "in_game":
-            await broadcast(room_code, {"t": "l", "u": uid})
-    print(f"[정리] {uid} 완료", flush=True)
-
-
-# ================================================================
-# 스냅샷 / 싱크
-# ================================================================
-def build_snapshot(room_code: str, exclude_uid: str) -> dict:
-    s    = sessions.get(room_code, {})
-    snap = {}
-    for uid, p in s.get("players", {}).items():
-        if uid == exclude_uid: continue
-        snap[uid] = {
-            "x":  round(p.get("x",  0),   2),
-            "y":  round(p.get("y",  0.5), 2),
-            "z":  round(p.get("z",  0),   2),
-            "ry": round(p.get("ry", 0),   3),
-            "hp": p.get("hp", 100),
-            "ko": p.get("ko", False),
-            "tm": p.get("tm", "r"),
-            "an": p.get("an", "idle"),
-        }
-    return snap
-
-def _state_sig(p: dict) -> str:
-    return (f"{round(p.get('x',0),1)},{round(p.get('z',0),1)},"
-            f"{p.get('hp',100)},{p.get('ko',False)},{p.get('an','idle')}")
-
-async def sync_loop(room_code: str):
-    interval   = 1.0 / SYNC_TICK_RATE
-    last_sigs: dict = {}
-    while room_code in sessions and sessions[room_code]["status"] == "in_game":
-        s     = sessions[room_code]
-        delta = {}
-        for uid, p in s["players"].items():
-            sig = _state_sig(p)
-            if last_sigs.get(uid) != sig:
-                last_sigs[uid] = sig
-                delta[uid] = {
-                    "x":  round(p.get("x",  0.0), 2),
-                    "y":  round(p.get("y",  0.5), 2),
-                    "z":  round(p.get("z",  0.0), 2),
-                    "ry": round(p.get("ry", 0.0), 3),
-                    "an": p.get("an", "idle"),
-                    "hp": p.get("hp", 100),
-                    "ko": p.get("ko", False),
-                    "tm": p.get("tm", "r"),
-                }
-        if delta:
-            await broadcast(room_code,
-                            {"t": "sv", "pos": delta, "ts": int(time.time() * 1000)})
-        await asyncio.sleep(interval)
-
-
-# ================================================================
-# KO / 전투
-# ================================================================
-async def ko_timer(room_code: str, uid: str):
-    await asyncio.sleep(KO_REVIVE_TIME)
-    if room_code not in sessions: return
-    s = sessions[room_code]
-    p = s["players"].get(uid)
-    if not p or not p.get("ko", False): return
-    p["nav_wp"] = None; p["nav_wait"] = 0
-    p["ko"] = False; p["hp"] = 30; p["penalty"] = True
-    print(f"[KO] {uid} 자동 기상", flush=True)
-    await broadcast(room_code,
-                    {"t": "rev", "uid": uid, "hp": 30, "penalty": True, "auto": True})
-
-async def process_attack(room_code: str, attacker_uid: str, msg: dict):
-    if room_code not in sessions: return
-    s        = sessions[room_code]
-    attacker = s["players"].get(attacker_uid)
-    if not attacker or attacker.get("ko", False): return
-    weapon    = s["weapons"].get(attacker_uid, {}).get("weapon", "baguette")
-    atk_range = WEAPON_STATS[weapon]["atk_range"]
-    damage    = WEAPON_STATS[weapon]["damage"]
-    if not check_attack_cooldown(attacker_uid, weapon): return
-    atk_team       = attacker.get("tm", "r")
-    attacker["x"]  = msg.get("x",  attacker.get("x",  0))
-    attacker["z"]  = msg.get("z",  attacker.get("z",  0))
-    attacker["ry"] = msg.get("ry", attacker.get("ry", 0))
-    for tid, target in s["players"].items():
-        if tid == attacker_uid: continue
-        if target.get("tm") == atk_team: continue
-        if target.get("ko", False): continue
-        if dist_2d(attacker, target) > atk_range: continue
-        target["hp"] = max(0, target["hp"] - damage)
-        await broadcast(room_code,
-                        {"t": "hit", "attacker": attacker_uid, "target": tid,
-                         "damage": damage, "hp": target["hp"], "weapon": weapon})
-        if target["hp"] <= 0:
-            target["hp"] = 0; target["ko"] = True; target["ko_time"] = time.time()
-            target["nav_wp"] = None; target["nav_wait"] = 0
-            await broadcast(room_code, {"t": "ko", "uid": tid})
-            asyncio.create_task(ko_timer(room_code, tid))
-
-async def process_rescue(room_code: str, rescuer_uid: str, target_uid: str):
-    if room_code not in sessions: return
-    s       = sessions[room_code]
-    rescuer = s["players"].get(rescuer_uid)
-    target  = s["players"].get(target_uid)
-    if not rescuer or not target: return
-    if not target.get("ko", False): return
-    if rescuer.get("tm") != target.get("tm"): return
-    if dist_2d(rescuer, target) > 1.5: return
-    elapsed = time.time() - target.get("ko_time", time.time())
-    if elapsed > RESCUE_WINDOW:
-        await send_to(rescuer_uid,
-                      {"t": "res_fail", "target": target_uid, "reason": "timeout"})
-        return
-    target["nav_wp"] = None; target["nav_wait"] = 0
-    target["ko"] = False; target["hp"] = 100; target["penalty"] = False
-    await broadcast(room_code,
-                    {"t": "rev", "uid": target_uid, "hp": 100,
-                     "penalty": False, "auto": False, "rescuer": rescuer_uid})
-
-
-# ================================================================
-# 룸 세션 생성
-# ================================================================
-async def create_game_session(room_code: str, room_data: dict):
-    if room_code in sessions:
-        print(f"[Session] {room_code} 이미 존재", flush=True)
-        return sessions[room_code]
-
-    players_data = room_data.get("players", {})
-    host_uid     = room_data.get("hostId", "")
-    max_players  = room_data.get("maxPlayers", 4)
-
-    real_uids = []
-    ai_uids   = []
-    for uid, pinfo in players_data.items():
-        if pinfo.get("isAI", False):
-            ai_uids.append(uid)
-        else:
-            real_uids.append(uid)
-
-    # 팀 배정: 호스트 레드팀 고정, 나머지 절반씩
-    all_uids  = real_uids + ai_uids
-    half      = max(1, len(all_uids) // 2)
-    team_red  = all_uids[:half]
-    team_blue = all_uids[half:]
-
-    sel_map = random.choice(MAPS)
-
-    # AI 초기 배치
-    ai_players = {}
-    ai_weapons = {}
-    red_idx = 0; blue_idx = 0
-
-    for uid in ai_uids:
-        team   = "r" if uid in team_red else "b"
-        weapon = random.choice(WEAPONS)
-        ai_weapons[uid] = {"weapon": weapon, **WEAPON_STATS[weapon]}
-
-        if team == "r":
-            spawn = {"x": -10.0 + red_idx * 0.5, "y": 0.5,
-                     "z": float(red_idx * 2 - 3)}
-            red_idx += 1
-        else:
-            spawn = {"x": 10.0 + blue_idx * 0.5, "y": 0.5,
-                     "z": float(blue_idx * 2 - 3)}
-            blue_idx += 1
-
-        role = "defender" if (red_idx + blue_idx) % 2 == 0 else "pressure"
-        ai_players[uid] = {
-            "tm": team, "hp": 100, "ko": False, "penalty": False,
-            "atk_cd": random.uniform(0, 1.2),
-            "ai_role": role, "nav_wp": None, "nav_wait": 0,
-            "strafe_dir": 1, "flank_side": 0, "tick": 0,
-            "disconnected": False,
-            **spawn, "ry": 0.0 if team == "r" else 3.14, "an": "idle"
-        }
-
-    sessions[room_code] = {
-        "expected":        set(real_uids),
-        "connected":       set(),
-        "players":         ai_players,
-        "weapons":         dict(ai_weapons),
-        "weapon_selected": set(ai_uids),   # AI는 이미 선택 완료
-        "map_id":          sel_map,
-        "team_red":        team_red,
-        "team_blue":       team_blue,
-        "status":          "loading",
-        "host_uid":        host_uid,
-        "max_players":     max_players,
-        "room_name":       room_data.get("roomName", "방 " + room_code),
-        "ai_uids":         ai_uids,
-        "created_at":      time.time(),
-    }
-
-    print(f"[Session] {room_code} 생성 완료 "
-          f"real={len(real_uids)} AI={len(ai_uids)} "
-          f"RED={team_red} BLUE={team_blue}", flush=True)
-
-    # RTDB에 gameStatus = starting + 팀 정보 기록
-    await rtdb_patch(f"rooms/{room_code}", {
-        "gameStatus": "starting",
-        "teamRed":    team_red,
-        "teamBlue":   team_blue,
-        "mapId":      sel_map,
-    })
-
-    asyncio.create_task(_session_timeout_watch(room_code))
-    return sessions[room_code]
-
-
-async def _session_timeout_watch(room_code: str):
-    await asyncio.sleep(JOIN_TIMEOUT)
-    if room_code not in sessions: return
-    s = sessions[room_code]
-    if s["status"] == "in_game": return
-    print(f"[Timeout] {room_code} JOIN_TIMEOUT 초과 → 정리", flush=True)
-    await broadcast(room_code, {"t": "s", "r": "timeout"})
-    await _cancel_session(room_code)
-
-
-async def _cancel_session(room_code: str):
-    if room_code not in sessions: return
-    sessions.pop(room_code, None)
-    await redis_del(f"room:{room_code}")
-    await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "waiting"})
-    print(f"[Session] {room_code} 정리 완료", flush=True)
-
-
-async def check_all_weapons_selected(room_code: str):
-    if room_code not in sessions: return
-    s = sessions[room_code]
-    # expected = 실제 유저만, AI는 weapon_selected에 이미 포함
-    real_selected = s["weapon_selected"].intersection(s["expected"])
-    if real_selected != s["expected"]: return
-    s["status"] = "in_game"
-    print(f"[Weapon] {room_code} 전원 선택 → 게임 시작", flush=True)
-    await broadcast(room_code, {
-        "t":         "w_ready",
-        "room_code": room_code,
-        "weapons":   s["weapons"],
-        "map_id":    s.get("map_id", "default"),
-        "team_red":  s["team_red"],
-        "team_blue": s["team_blue"],
-    })
-    await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "playing"})
-    asyncio.create_task(sync_loop(room_code))
-    asyncio.create_task(run_ai_loop(room_code, sessions, broadcast, ko_timer, AI_TICK_RATE))
-
-
-# ================================================================
-# HTTP 엔드포인트
-# ================================================================
-
-@app.post("/room/start")
-async def http_room_start(request: Request):
-    """
-    PartyManager.request_game_start() 에서 호출.
-    body: { "room_code": "ABCDE1", "host_uid": "...", "room_data": {...} }
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
-
-    room_code = body.get("room_code", "").upper().strip()
-    host_uid  = body.get("host_uid", "")
-    room_data = body.get("room_data", {})
-
-    if not room_code:
-        return JSONResponse({"ok": False, "error": "room_code required"}, status_code=400)
-
-    # 이미 세션 존재 → 중복 방지
-    if room_code in sessions:
-        s = sessions[room_code]
-        return JSONResponse({
-            "ok":            True,
-            "already_exists": True,
-            "status":        s["status"],
-            "team_red":      s["team_red"],
-            "team_blue":     s["team_blue"],
-            "map_id":        s["map_id"],
-        })
-
-    # room_data가 없으면 RTDB에서 읽기
-    if not room_data:
-        room_data = await rtdb_get(f"rooms/{room_code}")
-        if not room_data:
-            return JSONResponse({"ok": False, "error": "room not found"}, status_code=404)
-
-    # 호스트 검증
-    if room_data.get("hostId", "") != host_uid:
-        return JSONResponse({"ok": False, "error": "not host"}, status_code=403)
-
-    sess = await create_game_session(room_code, room_data)
-    if not sess:
-        return JSONResponse({"ok": False, "error": "session create failed"}, status_code=500)
-
-    print(f"[HTTP] 룸 시작 — room_code={room_code} host={host_uid}", flush=True)
-    return JSONResponse({
-        "ok":        True,
-        "room_code": room_code,
-        "team_red":  sess["team_red"],
-        "team_blue": sess["team_blue"],
-        "map_id":    sess["map_id"],
-    })
-
-
-@app.get("/room/{room_code}/status")
-async def http_room_status(room_code: str):
-    room_code = room_code.upper().strip()
-    if room_code not in sessions:
-        return JSONResponse({"ok": False, "exists": False})
-    s = sessions[room_code]
-    return JSONResponse({
-        "ok":        True,
-        "exists":    True,
-        "status":    s["status"],
-        "connected": len(s["connected"]),
-        "expected":  len(s["expected"]),
-        "team_red":  s["team_red"],
-        "team_blue": s["team_blue"],
-    })
-
-
-# ================================================================
-# WebSocket 엔드포인트
-# ================================================================
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    uid       = None
-    room_code = None
-    print("[WS] 연결", flush=True)
-    try:
-        while True:
-            raw = await ws.receive_text()
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            t = msg.get("t", "")
-
-            # ── 게임 참가
-            if t == "j":
-                uid       = msg.get("u", "")
-                room_code = msg.get("room_code", "").upper().strip()
-                team_hint = msg.get("tm", "")
-
-                if not room_code or room_code not in sessions:
-                    await ws.send_text(json.dumps({"t": "f", "r": "no_session"}))
-                    continue
-
-                s = sessions[room_code]
-
-                if uid not in s["expected"]:
-                    await ws.send_text(json.dumps({"t": "f", "r": "na"}))
-                    continue
-
-                # 기존 연결 정리
-                if uid in clients:
-                    old_ws = clients[uid].get("ws")
-                    if old_ws and old_ws is not ws:
-                        try: await old_ws.close()
-                        except: pass
-                    clients.pop(uid, None)
-
-                # 팀 결정 (서버 기준 우선)
-                if uid in s["team_red"]:
-                    team = "r"
-                elif uid in s["team_blue"]:
-                    team = "b"
-                else:
-                    team = team_hint if team_hint in ("r", "b") else "r"
-
-                clients[uid] = {
-                    "ws":               ws,
-                    "room_code":        room_code,
-                    "team":             team,
-                    "last_pos":         None,
-                    "last_pos_time":    time.time(),
-                    "last_attack_time": 0,
-                }
-                s["connected"].add(uid)
-
-                # 스폰 위치
-                is_reconnect = uid in s["players"] and not s["players"][uid].get("disconnected", True)
-                if is_reconnect:
-                    p = s["players"][uid]
-                    p["disconnected"] = False
-                    spawn = {"x": p["x"], "y": p["y"], "z": p["z"],
-                             "ry": p["ry"], "an": "idle"}
-                else:
-                    red_cnt  = len([u for u in s["team_red"]  if u in s["connected"]])
-                    blue_cnt = len([u for u in s["team_blue"] if u in s["connected"]])
-                    idx = (red_cnt - 1) if team == "r" else (blue_cnt - 1)
-                    if team == "r":
-                        spawn = {"x": -10.0, "y": 0.5,
-                                 "z": float(max(idx, 0) * 2), "ry": 0.0,  "an": "idle"}
-                    else:
-                        spawn = {"x": 10.0,  "y": 0.5,
-                                 "z": float(max(idx, 0) * 2), "ry": 3.14, "an": "idle"}
-                    s["players"][uid] = {
-                        "tm": team, "hp": 100, "ko": False, "penalty": False,
-                        "nav_wp": None, "nav_wait": 0, "strafe_dir": 1,
-                        "flank_side": 0, "tick": 0, "ai_role": "none",
-                        "disconnected": False, **spawn
-                    }
-
-                clients[uid]["last_pos"] = {"x": spawn["x"], "y": spawn["y"], "z": spawn["z"]}
-
-                snap = build_snapshot(room_code, uid)
-                cn   = len(s["connected"])
-                ex   = len(s["expected"])
-
-                await ws.send_text(json.dumps({
-                    "t":          "js",
-                    "u":          uid,
-                    "tm":         team,
-                    "sp":         spawn,
-                    "sn":         snap,
-                    "cn":         cn,
-                    "ex":         ex,
-                    "ai_weapons": s["weapons"],
-                    "map_id":     s.get("map_id", "default"),
-                    "reconnect":  s["status"] == "in_game",
-                    "team_red":   s["team_red"],
-                    "team_blue":  s["team_blue"],
-                    "room_code":  room_code,
-                }))
-
-                await broadcast(room_code,
-                                {"t": "sp", "u": uid, "tm": team,
-                                 "sp": spawn, "cn": cn, "ex": ex},
-                                exclude=uid)
-
-                # 전원 접속 시 게임 준비 알림
-                if s["expected"] == s["connected"]:
-                    await broadcast(room_code, {
-                        "t":         "g",
-                        "room_code": room_code,
-                        "r":         s["team_red"],
-                        "b":         s["team_blue"],
-                    })
-
-            # ── 무기 선택
-            elif t == "w_sel":
-                uid       = msg.get("u", "")
-                room_code = msg.get("room_code", "").upper().strip()
-                weapon    = msg.get("weapon", "baguette")
-                if room_code not in sessions: continue
-                s = sessions[room_code]
-                if weapon not in WEAPON_STATS: weapon = "baguette"
-                s["weapons"][uid]         = {"weapon": weapon, **WEAPON_STATS[weapon]}
-                s["weapon_selected"].add(uid)
-                await ws.send_text(json.dumps({
-                    "t":        "w_ok",
-                    "weapon":   weapon,
-                    "stats":    WEAPON_STATS[weapon],
-                    "cooldown": WEAPON_STATS[weapon]["cooldown"],
-                }))
-                asyncio.create_task(check_all_weapons_selected(room_code))
-
-            # ── 이동
-            elif t == "mv":
-                uid       = msg.get("u", "")
-                room_code = msg.get("room_code", "")
-                if not room_code and uid in clients:
-                    room_code = clients[uid].get("room_code", "")
-                if room_code not in sessions or uid not in clients: continue
-                s = sessions[room_code]
-                if uid not in s["players"]: continue
-                new_x = float(msg.get("x", 0))
-                new_y = float(msg.get("y", 0.5))
-                new_z = float(msg.get("z", 0))
-                valid, pos = validate_move(uid, new_x, new_y, new_z)
-                p       = s["players"][uid]
-                p["x"]  = pos["x"]; p["y"] = pos["y"]; p["z"] = pos["z"]
-                p["ry"] = msg.get("ry", p.get("ry", 0.0))
-                p["an"] = msg.get("an", p.get("an", "idle"))
-                clients[uid]["last_pos"]      = pos
-                clients[uid]["last_pos_time"] = time.time()
-                if not valid:
-                    await send_to(uid, {"t": "rb",
-                                        "x": pos["x"], "y": pos["y"], "z": pos["z"],
-                                        "force": True})
-
-            # ── 공격
-            elif t == "atk":
-                uid       = msg.get("u", "")
-                room_code = msg.get("room_code", "")
-                if not room_code and uid in clients:
-                    room_code = clients[uid].get("room_code", "")
-                asyncio.create_task(process_attack(room_code, uid, msg))
-
-            # ── 구조
-            elif t == "res":
-                uid       = msg.get("u", "")
-                room_code = msg.get("room_code", "")
-                if not room_code and uid in clients:
-                    room_code = clients[uid].get("room_code", "")
-                asyncio.create_task(process_rescue(room_code, uid, msg.get("target", "")))
-
-            # ── 핑
-            elif t == "p":
-                await ws.send_text(json.dumps({"t": "po"}))
-
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        print(f"[WS 오류] {uid}: {e}", flush=True)
-    finally:
-        if uid:
-            await _cleanup_client(uid)
-        print(f"[WS] 해제: {uid}", flush=True)
-
-
-# ================================================================
 # 헬스체크
 # ================================================================
 @app.get("/")
 async def health():
     return {
-        "status":          "ok",
-        "clients":         len(clients),
-        "sessions":        len(sessions),
-        "session_codes":   list(sessions.keys()),
-        "httpx":           _USE_HTTPX,
-        "rtdb_secret_len": len(RTDB_SECRET),
+        "status":   "ok",
+        "sessions": len(sessions),
+        "rooms":    list(sessions.keys()),
+        "httpx":    _USE_HTTPX,
+        "redis":    bool(REDIS_URL),
     }
 
 @app.head("/")
@@ -795,14 +868,14 @@ async def health_head():
 
 
 if __name__ == "__main__":
-    for var, name in [(RTDB_SECRET, "RTDB_SECRET"),
-                      (REDIS_URL,   "REDIS_URL"),
-                      (REDIS_TOKEN, "REDIS_TOKEN")]:
-        if not var:
-            print(f"[Server] 경고: {name} 없음!", flush=True)
+    for var, name in [
+        (RTDB_SECRET, "RTDB_SECRET"),
+        (REDIS_URL,   "REDIS_URL"),
+        (REDIS_TOKEN, "REDIS_TOKEN"),
+    ]:
+        if not var: print(f"[경고] {name} 없음!", flush=True)
     print(f"[Server] 포트 {WS_PORT}", flush=True)
     uvicorn.run(
         app, host="0.0.0.0", port=WS_PORT,
-        ws_ping_interval=WS_PING_INTERVAL,
-        ws_ping_timeout=30,
+        ws_ping_interval=20, ws_ping_timeout=30,
     )
