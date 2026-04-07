@@ -571,6 +571,34 @@ async def end_game(room_code: str, gs: dict, winner: str, reason: str):
 
 
 # ================================================================
+# 유틸
+# ================================================================
+def _calc_gd_blocked(gs: dict) -> list:
+    blocked = []
+    for _, data in gs.get("gamedev_teach", {}).items():
+        tgt = data.get("target", "")
+        if tgt and tgt not in blocked:
+            blocked.append(tgt)
+    return blocked
+
+
+# ================================================================
+# lifespan + app 선언  ← 핵심: 라우터보다 반드시 먼저!
+# ================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http_client
+    if _USE_HTTPX:
+        _http_client = httpx.AsyncClient(timeout=5.0)
+    print("[Startup] 마피아 서버 준비 완료", flush=True)
+    yield
+    if _http_client:
+        await _http_client.aclose()
+
+app = FastAPI(lifespan=lifespan)  # ← 여기서 app 생성, 이후 데코레이터 사용 가능
+
+
+# ================================================================
 # HTTP: 게임 시작
 # ================================================================
 @app.post("/room/start")
@@ -819,34 +847,6 @@ async def ws_mafia(ws: WebSocket):
             sessions[room_code]["players"].pop(uid, None)
             await broadcast(room_code, {"t": "player_left", "uid": uid})
         print(f"[WS] 해제: {uid}", flush=True)
-
-
-# ================================================================
-# 유틸
-# ================================================================
-def _calc_gd_blocked(gs: dict) -> list:
-    blocked = []
-    for _, data in gs.get("gamedev_teach", {}).items():
-        tgt = data.get("target", "")
-        if tgt and tgt not in blocked:
-            blocked.append(tgt)
-    return blocked
-
-
-# ================================================================
-# lifespan
-# ================================================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _http_client
-    if _USE_HTTPX:
-        _http_client = httpx.AsyncClient(timeout=5.0)
-    print("[Startup] 마피아 서버 준비 완료", flush=True)
-    yield
-    if _http_client:
-        await _http_client.aclose()
-
-app = FastAPI(lifespan=lifespan)
 
 
 # ================================================================
