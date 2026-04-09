@@ -600,6 +600,7 @@ app = FastAPI(lifespan=lifespan)  # ← 여기서 app 생성, 이후 데코레�
 
 # ================================================================
 # HTTP: 게임 시작
+# ✅ 수정 1: AI 포함 방 즉시 루프 시작 지원
 # ================================================================
 @app.post("/room/start")
 async def http_room_start(request: Request):
@@ -628,10 +629,19 @@ async def http_room_start(request: Request):
     if room_data.get("hostId", "") != host_uid:
         return JSONResponse({"ok": False, "error": "not host"}, 403)
 
-    await init_session(room_code, room_data)
+    gs = await init_session(room_code, room_data)
     await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "playing"})
 
-    print(f"[HTTP] 시작 room={room_code} host={host_uid}", flush=True)
+    # ✅ AI만 있거나 전원 AI인 방은 즉시 루프 시작
+    real_uids = [uid for uid, p in gs["players"].items() if not p.get("isAI")]
+    s = sessions[room_code]
+    if len(real_uids) == 0:
+        # 전원 AI (테스트용)
+        s["status"] = "playing"
+        s["phase_task"] = asyncio.create_task(phase_loop(room_code))
+        print(f"[HTTP] {room_code} 전원 AI → 루프 즉시 시작", flush=True)
+
+    print(f"[HTTP] 시작 room={room_code} host={host_uid} real={len(real_uids)}명", flush=True)
     return JSONResponse({"ok": True, "room_code": room_code})
 
 
@@ -705,15 +715,21 @@ async def ws_mafia(ws: WebSocket):
                     } if my_role in ("mafia", "anchor") else {},
                 }))
 
-                # 전원 접속 확인 → 페이즈 루프 시작
-                s           = sessions[room_code]
-                real_uids   = [u for u, p in gs["players"].items() if not p.get("isAI")]
-                connected   = [u for u, p in s["players"].items() if not p.get("isAI")]
-                if set(real_uids) == set(connected) and s["status"] == "waiting":
+                # ✅ 수정 2: AI 제외 실제 플레이어만 비교, 최소 1명 이상 접속 시 시작
+                s         = sessions[room_code]
+                real_uids = [u for u, p in gs["players"].items() if not p.get("isAI")]
+                connected = [u for u in s["players"] if not s["players"][u].get("isAI")]
+
+                all_connected = (len(real_uids) > 0 and set(real_uids) == set(connected))
+
+                if all_connected and s["status"] == "waiting":
                     s["status"] = "playing"
-                    if s.get("phase_task"): s["phase_task"].cancel()
+                    if s.get("phase_task"):
+                        s["phase_task"].cancel()
                     s["phase_task"] = asyncio.create_task(phase_loop(room_code))
-                    print(f"[WS] {room_code} 전원 접속 → 루프 시작", flush=True)
+                    print(f"[WS] {room_code} 전원 접속({len(connected)}/{len(real_uids)}) → 루프 시작", flush=True)
+                else:
+                    print(f"[WS] {room_code} 대기 중 {len(connected)}/{len(real_uids)}명 접속", flush=True)
 
                 await broadcast(room_code, {
                     "t":  "player_joined",
