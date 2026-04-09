@@ -1,8 +1,10 @@
 """
 mafia_server.py — 마피아 권위형 서버
-- Redis (Upstash): 게임 상태 저장 (역할/투표/생존 등)
-- RTDB: 방 목록 표시용 (gameStatus 반영만)
-- WebSocket /ws/mafia: 실시간 페이즈/투표/채팅 전체 관리
+수정:
+- AI 플레이어가 있는 방: 실제 플레이어 전원 접속 시 루프 시작 (AI 접속 대기 안 함)
+- game_started 메시지 → WS joined 시 phase 기반으로 클라이언트가 판단
+- 게임 종료 후 sessions 정리로 재진입 버그 방지
+- Redis 없이도 동작하는 인메모리 폴백
 """
 import asyncio, json, os, random, time
 from contextlib import asynccontextmanager
@@ -31,21 +33,21 @@ PHASE_TIMES = {
     "vote":    25,
 }
 MAX_ROUNDS  = 10
-SESSION_TTL = 3600  # Redis TTL (초)
+SESSION_TTL = 3600
 
 print(f"=== 마피아 서버 | httpx={_USE_HTTPX} | redis={bool(REDIS_URL)} ===", flush=True)
 
 # ================================================================
 # 전역
 # sessions[room_code] = {
-#   "players": { uid: { ws, nickname, tag, isHost, isAI } },
+#   "players":    { uid: { ws, nickname, tag, isHost, isAI } },
 #   "phase_task": asyncio.Task | None,
-#   "status":  "waiting" | "playing" | "ended"
+#   "status":     "waiting" | "playing" | "ended"
 # }
-# 게임 상태(역할/투표/생존)는 Redis 에 저장
 # ================================================================
-sessions: dict = {}
-_http_client   = None
+sessions: dict     = {}
+_mem_store: dict   = {}   # ✅ Redis 없을 때 인메모리 폴백
+_http_client       = None
 
 
 # ================================================================
@@ -113,7 +115,7 @@ async def rtdb_patch(path, d): return await _http_patch(_rtdb(path), d)
 
 
 # ================================================================
-# Redis 헬퍼 (Upstash REST)
+# Redis 헬퍼 (Upstash REST) + 인메모리 폴백
 # ================================================================
 def _redis_headers():
     return {"Authorization": f"Bearer {REDIS_TOKEN}", "Content-Type": "application/json"}
@@ -135,15 +137,24 @@ async def _redis_cmd(*args):
         print(f"[Redis 오류] {e}", flush=True); return None
 
 async def redis_set(key: str, value: dict, ex: int = SESSION_TTL):
+    if not REDIS_URL:
+        _mem_store[key] = json.dumps(value); return "OK"
     return await _redis_cmd("SET", key, json.dumps(value), "EX", ex)
 
 async def redis_get(key: str) -> dict | None:
+    if not REDIS_URL:
+        raw = _mem_store.get(key)
+        if raw is None: return None
+        try: return json.loads(raw)
+        except: return None
     raw = await _redis_cmd("GET", key)
     if raw is None: return None
     try: return json.loads(raw)
     except: return None
 
 async def redis_del(key: str):
+    if not REDIS_URL:
+        _mem_store.pop(key, None); return
     await _redis_cmd("DEL", key)
 
 def _gs_key(room_code: str) -> str:
@@ -225,15 +236,15 @@ async def init_session(room_code: str, room_data: dict) -> dict:
     uids     = list(pdata.keys())
     total    = len(uids)
 
-    # 역할 배정
     role_counts = calc_roles(total)
     role_list   = []
     for role, cnt in role_counts.items():
         role_list.extend([role] * cnt)
-    shuffled_uids = uids[:]
-    random.shuffle(shuffled_uids)
+
+    shuffled = uids[:]
+    random.shuffle(shuffled)
     random.shuffle(role_list)
-    roles = {uid: role_list[i] for i, uid in enumerate(shuffled_uids)}
+    roles = {uid: role_list[i] for i, uid in enumerate(shuffled)}
 
     gs = {
         "phase": "meet",
@@ -249,7 +260,6 @@ async def init_session(room_code: str, room_data: dict) -> dict:
                 "isHost":   pdata[uid].get("isHost", False),
             } for uid in uids
         },
-        # 밤 행동 (매 밤 초기화)
         "night_votes":        {},
         "doctor_protect":     {},
         "police_investigate": {},
@@ -258,9 +268,7 @@ async def init_session(room_code: str, room_data: dict) -> dict:
         "lawyer_block":       {},
         "anchor_target":      {},
         "gamedev_teach":      {},
-        # 낮 투표
-        "day_votes": {},
-        # 상태
+        "day_votes":          {},
         "tie_pool":                [],
         "consecutive_ties":        0,
         "anchor_translate_target": "",
@@ -268,6 +276,12 @@ async def init_session(room_code: str, room_data: dict) -> dict:
     }
 
     await save_gs(room_code, gs)
+
+    # ✅ 기존 세션 정리 후 새로 생성
+    if room_code in sessions:
+        old_task = sessions[room_code].get("phase_task")
+        if old_task and not old_task.done():
+            old_task.cancel()
 
     sessions[room_code] = {
         "players":    {},
@@ -287,10 +301,8 @@ async def process_night(room_code: str, gs: dict) -> dict:
     alive      = gs["alive"]
     alive_list = [u for u, a in alive.items() if a]
 
-    # 변호사 봉쇄
     lawyer_blocked = list(gs["lawyer_block"].values())
 
-    # 게임개발자 처리
     gd_blocked   = []
     gd_killed    = ""
     gd_csharp_t  = ""
@@ -312,7 +324,6 @@ async def process_night(room_code: str, gs: dict) -> dict:
             if tgt in alive_list:
                 if tgt not in gd_blocked: gd_blocked.append(tgt)
 
-    # 마피아 킬
     mafia_votes = {
         v: t for v, t in gs["night_votes"].items()
         if v not in lawyer_blocked and v not in gd_blocked
@@ -327,31 +338,27 @@ async def process_night(room_code: str, gs: dict) -> dict:
         cands = [t for t, c in count.items() if c == mx]
         mafia_target = random.choice(cands)
 
-    # 의사 보호
     protected = []
     for pid, tgt in gs["doctor_protect"].items():
         if pid in lawyer_blocked or pid in gd_blocked: continue
         if tgt not in protected: protected.append(tgt)
 
-    # 닥터길유
     doktor_target = ""
     for pid, tgt in gs["doktor_kill"].items():
         if pid in lawyer_blocked or pid in gd_blocked: continue
         if roles.get(pid) == "doktor_gil":
             doktor_target = tgt; break
 
-    # 점쟁이
     seer_results = {}
     for seer_id, tgt in gs["seer_divine"].items():
         if seer_id in lawyer_blocked or seer_id in gd_blocked: continue
         if roles.get(seer_id) != "seer": continue
-        real = roles.get(tgt, "citizen")
+        real  = roles.get(tgt, "citizen")
         shown = real if random.random() < 0.7 else (
             random.choice(["citizen","police","doctor","mayor"]) if real == "mafia" else "mafia"
         )
         seer_results[seer_id] = {"target": tgt, "shown_role": shown}
 
-    # 스토커
     police_results = {}
     for cop_id, tgt in gs["police_investigate"].items():
         if cop_id in lawyer_blocked or cop_id in gd_blocked: continue
@@ -361,14 +368,12 @@ async def process_night(room_code: str, gs: dict) -> dict:
             "result": "mafia" if roles.get(tgt) == "mafia" else "citizen"
         }
 
-    # 앵커
     anchor_tgt = ""
     for pid, tgt in gs["anchor_target"].items():
         if pid in lawyer_blocked or pid in gd_blocked: continue
         if roles.get(pid) == "anchor" and alive.get(tgt):
             anchor_tgt = tgt; break
 
-    # 사망 처리
     actual_elim = ""
     if mafia_target and mafia_target not in protected:
         alive[mafia_target] = False; actual_elim = mafia_target
@@ -381,7 +386,6 @@ async def process_night(room_code: str, gs: dict) -> dict:
     if gd_killed and gd_killed not in (actual_elim, actual_doktor):
         alive[gd_killed] = False; actual_gd_dead = gd_killed
 
-    # C# 은폐
     show_elim = actual_elim
     if gd_csharp_t:
         if gd_csharp_t not in alive_list or gd_csharp_t == actual_elim:
@@ -403,10 +407,9 @@ async def process_night(room_code: str, gs: dict) -> dict:
         "anchor_target":         anchor_tgt,
     }
 
-    gs["alive"]                    = alive
-    gs["morning_result"]           = mr
-    gs["anchor_translate_target"]  = anchor_tgt
-    # 밤 행동 초기화
+    gs["alive"]                   = alive
+    gs["morning_result"]          = mr
+    gs["anchor_translate_target"] = anchor_tgt
     for k in ["night_votes","doctor_protect","police_investigate",
               "doktor_kill","seer_divine","lawyer_block","anchor_target","gamedev_teach"]:
         gs[k] = {}
@@ -466,7 +469,7 @@ def check_win(gs: dict) -> str | None:
 
 
 # ================================================================
-# 페이즈 루프 (권위형 타이머)
+# 페이즈 루프
 # ================================================================
 async def phase_loop(room_code: str):
     print(f"[Phase] {room_code} 루프 시작", flush=True)
@@ -476,7 +479,6 @@ async def phase_loop(room_code: str):
             phase = gs.get("phase", "meet")
             wait  = PHASE_TIMES.get(phase, 10)
 
-            # 페이즈 시작 알림
             await broadcast(room_code, {
                 "t":     "phase",
                 "phase": phase,
@@ -484,7 +486,6 @@ async def phase_loop(room_code: str):
                 "time":  wait,
             })
 
-            # 1초 틱
             for rem in range(wait, 0, -1):
                 if room_code not in sessions: return
                 await asyncio.sleep(1)
@@ -494,7 +495,6 @@ async def phase_loop(room_code: str):
             if room_code not in sessions: return
             gs = await load_gs(room_code)
 
-            # ── 페이즈 전환 ──────────────────────────────────
             if phase == "meet":
                 gs["phase"] = "night"
                 await save_gs(room_code, gs)
@@ -504,7 +504,6 @@ async def phase_loop(room_code: str):
                 gs["phase"] = "morning"
                 await save_gs(room_code, gs)
 
-                # morning 브로드캐스트 + 슬립 (별도 루프 반복 없이 인라인)
                 await broadcast(room_code, {
                     "t":      "phase",
                     "phase":  "morning",
@@ -518,7 +517,7 @@ async def phase_loop(room_code: str):
                     if rem % 5 == 0 or rem <= 5:
                         await broadcast(room_code, {"t": "tick", "time": rem - 1})
 
-                gs = await load_gs(room_code)
+                gs     = await load_gs(room_code)
                 winner = check_win(gs)
                 if winner or gs["day"] >= MAX_ROUNDS:
                     await end_game(room_code, gs, winner or "citizen", "elimination")
@@ -549,7 +548,8 @@ async def phase_loop(room_code: str):
     except asyncio.CancelledError:
         print(f"[Phase] {room_code} 취소", flush=True)
     except Exception as e:
-        print(f"[Phase] {room_code} 오류: {e}", flush=True)
+        import traceback
+        print(f"[Phase] {room_code} 오류: {e}\n{traceback.format_exc()}", flush=True)
 
 
 async def end_game(room_code: str, gs: dict, winner: str, reason: str):
@@ -566,8 +566,18 @@ async def end_game(room_code: str, gs: dict, winner: str, reason: str):
     })
     if room_code in sessions:
         sessions[room_code]["status"] = "ended"
+    # ✅ RTDB gameStatus → ended (팀원 재입장 방지)
     await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "ended"})
+    # ✅ 일정 시간 후 세션 메모리 정리
+    asyncio.create_task(_cleanup_session(room_code, delay=60))
     print(f"[End] {room_code} winner={winner}", flush=True)
+
+async def _cleanup_session(room_code: str, delay: int = 60):
+    await asyncio.sleep(delay)
+    if room_code in sessions and sessions[room_code]["status"] == "ended":
+        sessions.pop(room_code, None)
+        await redis_del(_gs_key(room_code))
+        print(f"[Cleanup] {room_code} 세션 삭제", flush=True)
 
 
 # ================================================================
@@ -583,7 +593,7 @@ def _calc_gd_blocked(gs: dict) -> list:
 
 
 # ================================================================
-# lifespan + app 선언  ← 핵심: 라우터보다 반드시 먼저!
+# lifespan + app
 # ================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -595,19 +605,14 @@ async def lifespan(app: FastAPI):
     if _http_client:
         await _http_client.aclose()
 
-app = FastAPI(lifespan=lifespan)  # ← 여기서 app 생성, 이후 데코레이터 사용 가능
+app = FastAPI(lifespan=lifespan)
 
 
 # ================================================================
 # HTTP: 게임 시작
-# ✅ 수정 1: AI 포함 방 즉시 루프 시작 지원
 # ================================================================
 @app.post("/room/start")
 async def http_room_start(request: Request):
-    """
-    RoomWaiting.gd 호스트가 게임 시작 버튼 누를 때 호출.
-    body: { room_code, host_uid, room_data? }
-    """
     try: body = await request.json()
     except: return JSONResponse({"ok": False, "error": "invalid json"}, 400)
 
@@ -618,6 +623,7 @@ async def http_room_start(request: Request):
     if not room_code:
         return JSONResponse({"ok": False, "error": "room_code required"}, 400)
 
+    # ✅ 이미 playing 중이면 재시작 금지
     if room_code in sessions and sessions[room_code]["status"] == "playing":
         return JSONResponse({"ok": True, "already": True})
 
@@ -632,12 +638,11 @@ async def http_room_start(request: Request):
     gs = await init_session(room_code, room_data)
     await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "playing"})
 
-    # ✅ AI만 있거나 전원 AI인 방은 즉시 루프 시작
+    # AI만 있는 방은 즉시 루프 시작
     real_uids = [uid for uid, p in gs["players"].items() if not p.get("isAI")]
     s = sessions[room_code]
     if len(real_uids) == 0:
-        # 전원 AI (테스트용)
-        s["status"] = "playing"
+        s["status"]     = "playing"
         s["phase_task"] = asyncio.create_task(phase_loop(room_code))
         print(f"[HTTP] {room_code} 전원 AI → 루프 즉시 시작", flush=True)
 
@@ -664,8 +669,8 @@ async def http_room_state(room_code: str):
 @app.websocket("/ws/mafia")
 async def ws_mafia(ws: WebSocket):
     await ws.accept()
-    uid       = None
-    room_code = None
+    uid:       str | None = None
+    room_code: str | None = None
 
     try:
         while True:
@@ -688,7 +693,6 @@ async def ws_mafia(ws: WebSocket):
                     await ws.send_text(json.dumps({"t": "error", "r": "not_in_room"}))
                     continue
 
-                # WS 등록
                 pinfo = gs["players"][uid]
                 sessions[room_code]["players"][uid] = {
                     "ws":       ws,
@@ -700,7 +704,6 @@ async def ws_mafia(ws: WebSocket):
 
                 my_role = gs["roles"].get(uid, "citizen")
 
-                # 현재 상태 전송 (재접속 포함)
                 await ws.send_text(json.dumps({
                     "t":         "joined",
                     "uid":       uid,
@@ -715,8 +718,8 @@ async def ws_mafia(ws: WebSocket):
                     } if my_role in ("mafia", "anchor") else {},
                 }))
 
-                # ✅ 수정 2: AI 제외 실제 플레이어만 비교, 최소 1명 이상 접속 시 시작
                 s         = sessions[room_code]
+                # ✅ AI 제외 실제 플레이어만 접속 확인
                 real_uids = [u for u, p in gs["players"].items() if not p.get("isAI")]
                 connected = [u for u in s["players"] if not s["players"][u].get("isAI")]
 
@@ -724,30 +727,28 @@ async def ws_mafia(ws: WebSocket):
 
                 if all_connected and s["status"] == "waiting":
                     s["status"] = "playing"
-                    if s.get("phase_task"):
+                    if s.get("phase_task") and not s["phase_task"].done():
                         s["phase_task"].cancel()
                     s["phase_task"] = asyncio.create_task(phase_loop(room_code))
-                    print(f"[WS] {room_code} 전원 접속({len(connected)}/{len(real_uids)}) → 루프 시작", flush=True)
+                    print(f"[WS] {room_code} 전원 접속 ({len(connected)}/{len(real_uids)}) → 루프 시작", flush=True)
                 else:
-                    print(f"[WS] {room_code} 대기 중 {len(connected)}/{len(real_uids)}명 접속", flush=True)
+                    print(f"[WS] {room_code} 대기 {len(connected)}/{len(real_uids)}명", flush=True)
 
                 await broadcast(room_code, {
-                    "t":  "player_joined",
+                    "t":   "player_joined",
                     "uid": uid,
-                    "cn": len(connected),
-                    "ex": len(real_uids),
+                    "cn":  len(connected),
+                    "ex":  len(real_uids),
                 }, exclude=uid)
 
             # ── 밤 행동 ──────────────────────────────────────
             elif t == "night_action":
                 if not (uid and room_code and room_code in sessions): continue
-                gs     = await load_gs(room_code)
+                gs = await load_gs(room_code)
                 if not gs["alive"].get(uid): continue
                 if gs["phase"] != "night": continue
 
                 my_role = gs["roles"].get(uid, "")
-
-                # 봉쇄 체크
                 if uid in gs["lawyer_block"].values(): continue
                 gd_blocked = _calc_gd_blocked(gs)
                 if uid in gd_blocked: continue
@@ -801,13 +802,11 @@ async def ws_mafia(ws: WebSocket):
                 text    = msg.get("text", "").strip()
                 if not text: continue
 
-                # 밤 일반채팅 차단
                 if gs["phase"] == "night" and channel == "general": continue
 
                 my_role = gs["roles"].get(uid, "")
                 if channel == "mafia" and my_role not in ("mafia", "anchor"): continue
 
-                # 앵커 강제 번역기
                 if channel == "general" and uid == gs.get("anchor_translate_target", ""):
                     suffixes = [
                         " (사실 난 마피아야 쿳소!)",
@@ -846,11 +845,9 @@ async def ws_mafia(ws: WebSocket):
                     "emotion": msg.get("emotion", ""),
                 }, exclude=uid)
 
-            # ── 핑 ───────────────────────────────────────────
             elif t == "ping":
                 await ws.send_text(json.dumps({"t": "pong"}))
 
-            # ── 나가기 ───────────────────────────────────────
             elif t == "leave":
                 break
 
@@ -889,7 +886,7 @@ if __name__ == "__main__":
         (REDIS_URL,   "REDIS_URL"),
         (REDIS_TOKEN, "REDIS_TOKEN"),
     ]:
-        if not var: print(f"[경고] {name} 없음!", flush=True)
+        if not var: print(f"[경고] {name} 없음 (인메모리 폴백 사용)", flush=True)
     print(f"[Server] 포트 {WS_PORT}", flush=True)
     uvicorn.run(
         app, host="0.0.0.0", port=WS_PORT,
