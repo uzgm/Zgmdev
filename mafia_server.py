@@ -5,6 +5,7 @@ mafia_server.py — 마피아 권위형 서버
 - joined 메시지에 roles 전체 포함 (클라이언트 역할 표시용)
 - init_session에서 기존 WS 백업/복원
 - join 재수신 시 루프 시작 보장
+- [신규] AI 플레이어 자동 행동 (밤 행동 + 낮 투표)
 """
 import asyncio, json, os, random, time
 from contextlib import asynccontextmanager
@@ -34,6 +35,10 @@ PHASE_TIMES = {
 }
 MAX_ROUNDS  = 10
 SESSION_TTL = 3600
+
+# AI 행동 딜레이: 밤 시작 후 몇 초 뒤에 행동할지 (랜덤 범위, 단위 초)
+AI_ACTION_DELAY_MIN = 3
+AI_ACTION_DELAY_MAX = 10
 
 print(f"=== 마피아 서버 | httpx={_USE_HTTPX} | redis={bool(REDIS_URL)} ===", flush=True)
 
@@ -283,6 +288,207 @@ async def init_session(room_code: str, room_data: dict) -> dict:
 
 
 # ================================================================
+# ★ AI 자동 행동
+# ================================================================
+async def ai_do_night_actions(room_code: str):
+    """밤 페이즈: AI 플레이어들이 랜덤 딜레이 후 각자 역할에 맞게 행동"""
+    gs = await load_gs(room_code)
+    if not gs or gs.get("phase") != "night":
+        return
+
+    roles = gs["roles"]
+    alive = gs["alive"]
+
+    # 살아있는 플레이어 목록
+    alive_list = [u for u, a in alive.items() if a]
+
+    # AI 플레이어만 추출
+    ai_uids = [
+        uid for uid, pinfo in gs["players"].items()
+        if pinfo.get("isAI", False) and alive.get(uid, False)
+    ]
+
+    if not ai_uids:
+        return
+
+    print(f"[AI] {room_code} 밤 행동 시작: {len(ai_uids)}명", flush=True)
+
+    async def _act(uid: str):
+        # 랜덤 딜레이 (자연스럽게)
+        delay = random.uniform(AI_ACTION_DELAY_MIN, AI_ACTION_DELAY_MAX)
+        await asyncio.sleep(delay)
+
+        # 딜레이 후 GS 다시 읽기 (혹시 페이즈 바뀌었을 수 있음)
+        cur_gs = await load_gs(room_code)
+        if not cur_gs or cur_gs.get("phase") != "night":
+            return
+        if not cur_gs["alive"].get(uid, False):
+            return
+
+        cur_roles = cur_gs["roles"]
+        cur_alive = cur_gs["alive"]
+        cur_alive_list = [u for u, a in cur_alive.items() if a]
+
+        my_role = cur_roles.get(uid, "citizen")
+
+        # 이미 행동했으면 스킵
+        if uid in cur_gs.get("lawyer_block", {}).values():
+            print(f"[AI] {uid} ({my_role}) 변호사에 막혀 행동 불가", flush=True)
+            return
+
+        # 역할별 행동 결정
+        field    = None
+        target   = None
+        lang     = None
+
+        if my_role == "mafia":
+            # 마피아: 살아있는 비-마피아 중 랜덤 선택
+            candidates = [
+                u for u in cur_alive_list
+                if u != uid and cur_roles.get(u) != "mafia"
+            ]
+            if candidates:
+                field  = "night_votes"
+                target = random.choice(candidates)
+
+        elif my_role == "doctor":
+            # 의사: 살아있는 사람 중 랜덤 보호 (자기 자신 포함 가능)
+            candidates = [u for u in cur_alive_list]
+            if candidates:
+                field  = "doctor_protect"
+                target = random.choice(candidates)
+
+        elif my_role == "police":
+            # 경찰: 살아있는 비-자신 중 랜덤 조사
+            candidates = [u for u in cur_alive_list if u != uid]
+            if candidates:
+                field  = "police_investigate"
+                target = random.choice(candidates)
+
+        elif my_role == "doktor_gil":
+            # 닥터길유: 살아있는 비-자신 중 랜덤 처치
+            candidates = [u for u in cur_alive_list if u != uid]
+            if candidates:
+                field  = "doktor_kill"
+                target = random.choice(candidates)
+
+        elif my_role == "seer":
+            # 점쟁이: 살아있는 비-자신 중 랜덤 점술
+            candidates = [u for u in cur_alive_list if u != uid]
+            if candidates:
+                field  = "seer_divine"
+                target = random.choice(candidates)
+
+        elif my_role == "lawyer":
+            # 변호사: 살아있는 비-자신 중 랜덤 봉쇄
+            candidates = [u for u in cur_alive_list if u != uid]
+            if candidates:
+                field  = "lawyer_block"
+                target = random.choice(candidates)
+
+        elif my_role == "anchor":
+            # 앵커: 살아있는 비-자신 중 랜덤 번역기 장착
+            candidates = [u for u in cur_alive_list if u != uid]
+            if candidates:
+                field  = "anchor_target"
+                target = random.choice(candidates)
+
+        elif my_role == "gamedev":
+            # 게임개발자: 살아있는 비-자신 중 랜덤 (언어는 가중치 랜덤)
+            candidates = [u for u in cur_alive_list if u != uid]
+            if candidates:
+                target = random.choice(candidates)
+                # python 50%, csharp 30%, cpp 20%
+                lang = random.choices(
+                    ["python", "csharp", "cpp"],
+                    weights=[50, 30, 20]
+                )[0]
+                # gamedev_teach는 별도 처리
+                cur_gs["gamedev_teach"][uid] = {"target": target, "lang": lang}
+                await save_gs(room_code, cur_gs)
+                print(f"[AI] {uid} (gamedev) → {target} lang={lang}", flush=True)
+                return
+
+        elif my_role == "citizen" or my_role == "mayor":
+            # 시민/시장: 밤 행동 없음
+            return
+
+        # GS에 기록
+        if field and target:
+            # 재로드 후 기록 (동시 접근 충돌 방지)
+            fresh_gs = await load_gs(room_code)
+            if not fresh_gs or fresh_gs.get("phase") != "night":
+                return
+            if not fresh_gs["alive"].get(uid, False):
+                return
+            fresh_gs[field][uid] = target
+            await save_gs(room_code, fresh_gs)
+            print(f"[AI] {uid} ({my_role}) → {field}={target}", flush=True)
+
+    # 모든 AI 동시에 (각자 딜레이 포함)
+    await asyncio.gather(*[_act(uid) for uid in ai_uids], return_exceptions=True)
+    print(f"[AI] {room_code} 밤 행동 완료", flush=True)
+
+
+async def ai_do_vote_actions(room_code: str):
+    """투표 페이즈: AI 플레이어들이 랜덤 딜레이 후 투표"""
+    gs = await load_gs(room_code)
+    if not gs or gs.get("phase") != "vote":
+        return
+
+    roles = gs["roles"]
+    alive = gs["alive"]
+    alive_list = [u for u, a in alive.items() if a]
+
+    ai_uids = [
+        uid for uid, pinfo in gs["players"].items()
+        if pinfo.get("isAI", False) and alive.get(uid, False)
+    ]
+
+    if not ai_uids:
+        return
+
+    print(f"[AI] {room_code} 투표 시작: {len(ai_uids)}명", flush=True)
+
+    async def _vote(uid: str):
+        delay = random.uniform(AI_ACTION_DELAY_MIN, AI_ACTION_DELAY_MAX)
+        await asyncio.sleep(delay)
+
+        cur_gs = await load_gs(room_code)
+        if not cur_gs or cur_gs.get("phase") != "vote":
+            return
+        if not cur_gs["alive"].get(uid, False):
+            return
+
+        cur_roles    = cur_gs["roles"]
+        cur_alive    = cur_gs["alive"]
+        cur_alive_list = [u for u, a in cur_alive.items() if a]
+
+        my_role = cur_roles.get(uid, "citizen")
+
+        # 마피아는 비-마피아 투표, 시민팀은 랜덤 (마피아 의심 로직 없음)
+        if my_role == "mafia":
+            candidates = [u for u in cur_alive_list if u != uid and cur_roles.get(u) != "mafia"]
+        else:
+            candidates = [u for u in cur_alive_list if u != uid]
+
+        if not candidates:
+            return
+
+        target = random.choice(candidates)
+
+        fresh_gs = await load_gs(room_code)
+        if not fresh_gs or fresh_gs.get("phase") != "vote":
+            return
+        fresh_gs["day_votes"][uid] = target
+        await save_gs(room_code, fresh_gs)
+        print(f"[AI] {uid} ({my_role}) 투표 → {target}", flush=True)
+
+    await asyncio.gather(*[_vote(uid) for uid in ai_uids], return_exceptions=True)
+    print(f"[AI] {room_code} 투표 완료", flush=True)
+
+
+# ================================================================
 # 밤 행동 처리
 # ================================================================
 async def process_night(room_code: str, gs: dict) -> dict:
@@ -458,7 +664,7 @@ def check_win(gs: dict) -> str | None:
 
 
 # ================================================================
-# 페이즈 루프 — ★ tick 매 초 전송
+# 페이즈 루프 — tick 매 초 전송 + AI 행동 포함
 # ================================================================
 async def phase_loop(room_code: str):
     print(f"[Phase] {room_code} 루프 시작", flush=True)
@@ -475,7 +681,15 @@ async def phase_loop(room_code: str):
                 "time":  wait,
             })
 
-            # ★ 매 초 tick (wait초부터 0까지)
+            # ★ 밤 페이즈 시작 시 AI 자동 행동 태스크 실행
+            if phase == "night":
+                asyncio.create_task(ai_do_night_actions(room_code))
+
+            # ★ 투표 페이즈 시작 시 AI 자동 투표 태스크 실행
+            elif phase == "vote":
+                asyncio.create_task(ai_do_vote_actions(room_code))
+
+            # 매 초 tick (wait초부터 0까지)
             for rem in range(wait - 1, -1, -1):
                 if room_code not in sessions: return
                 await asyncio.sleep(1)
@@ -501,7 +715,7 @@ async def phase_loop(room_code: str):
                     "time":   morning_wait,
                     "result": mr,
                 })
-                # ★ 아침도 매 초 tick
+                # 아침도 매 초 tick
                 for rem in range(morning_wait - 1, -1, -1):
                     if room_code not in sessions: return
                     await asyncio.sleep(1)
@@ -728,7 +942,6 @@ async def ws_mafia(ws: WebSocket):
 
                 my_role = gs["roles"].get(uid, "citizen")
 
-                # ★ joined에 roles 전체 포함 → 클라이언트가 my_role을 직접 파악 가능
                 await ws.send_text(json.dumps({
                     "t":       "joined",
                     "uid":     uid,
