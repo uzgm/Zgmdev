@@ -1,18 +1,10 @@
 """
 mafia_server.py — 마피아 권위형 서버
 수정:
-- AI 플레이어가 있는 방: 실제 플레이어 전원 접속 시 루프 시작 (AI 접속 대기 안 함)
-- game_started 메시지 → WS joined 시 phase 기반으로 클라이언트가 판단
-- 게임 종료 후 sessions 정리로 재진입 버그 방지
-- Redis 없이도 동작하는 인메모리 폴백
-- 재연결(joined 재수신) 시 phase_loop 중복 시작 방지 강화
-- 이미 playing 중인 방에 늦게 접속하는 플레이어도 joined 정상 수신
-
-★ 버그픽스 (2025):
-- init_session이 sessions[room_code]를 통째로 교체하면서 기존 WS 연결을 날리는 문제 수정
-  → /room/start 시 기존 players WS를 백업 후 GS 초기화, 세션 재생성 시 WS 복원
-- join 재수신 시 status가 "waiting"→"playing" 전환 + 루프 시작을 더 명확하게 처리
-  → _should_start_loop가 False여도 status=="playing"이고 루프 없으면 재시작
+- tick: 매 초 전송 (기존 5초 간격 → 1초 간격)
+- joined 메시지에 roles 전체 포함 (클라이언트 역할 표시용)
+- init_session에서 기존 WS 백업/복원
+- join 재수신 시 루프 시작 보장
 """
 import asyncio, json, os, random, time
 from contextlib import asynccontextmanager
@@ -45,17 +37,9 @@ SESSION_TTL = 3600
 
 print(f"=== 마피아 서버 | httpx={_USE_HTTPX} | redis={bool(REDIS_URL)} ===", flush=True)
 
-# ================================================================
-# 전역
-# sessions[room_code] = {
-#   "players":    { uid: { ws, nickname, tag, isHost, isAI } },
-#   "phase_task": asyncio.Task | None,
-#   "status":     "waiting" | "playing" | "ended"
-# }
-# ================================================================
-sessions: dict     = {}
-_mem_store: dict   = {}
-_http_client       = None
+sessions: dict   = {}
+_mem_store: dict = {}
+_http_client     = None
 
 
 # ================================================================
@@ -72,22 +56,6 @@ async def _http_get(url: str):
         return json.loads(raw)
     except Exception as e:
         print(f"[GET 오류] {e}", flush=True); return None
-
-async def _http_put(url: str, data) -> bool:
-    try:
-        body = json.dumps(data)
-        if _USE_HTTPX and _http_client:
-            r = await _http_client.put(url, content=body,
-                                        headers={"Content-Type": "application/json"})
-            return r.status_code == 200
-        import urllib.request as ur
-        loop = asyncio.get_event_loop()
-        req = ur.Request(url, data=body.encode(),
-                         headers={"Content-Type": "application/json"}, method="PUT")
-        await loop.run_in_executor(None, lambda: ur.urlopen(req, timeout=5))
-        return True
-    except Exception as e:
-        print(f"[PUT 오류] {e}", flush=True); return False
 
 async def _http_patch(url: str, data) -> bool:
     try:
@@ -123,7 +91,7 @@ async def rtdb_patch(path, d): return await _http_patch(_rtdb(path), d)
 
 
 # ================================================================
-# Redis 헬퍼 (Upstash REST) + 인메모리 폴백
+# Redis 헬퍼 + 인메모리 폴백
 # ================================================================
 def _redis_headers():
     return {"Authorization": f"Bearer {REDIS_TOKEN}", "Content-Type": "application/json"}
@@ -168,10 +136,6 @@ async def redis_del(key: str):
 def _gs_key(room_code: str) -> str:
     return f"mafia:gs:{room_code}"
 
-
-# ================================================================
-# 게임 상태 로드/저장
-# ================================================================
 async def load_gs(room_code: str) -> dict:
     gs = await redis_get(_gs_key(room_code))
     return gs or {}
@@ -236,8 +200,7 @@ async def send_to(room_code: str, uid: str, msg: dict):
 
 
 # ================================================================
-# 세션 초기화
-# ★ 버그픽스: 기존 세션의 WS 연결을 백업하고 init 후 복원
+# 세션 초기화 (기존 WS 백업/복원)
 # ================================================================
 async def init_session(room_code: str, room_data: dict) -> dict:
     pdata    = room_data.get("players", {})
@@ -286,25 +249,23 @@ async def init_session(room_code: str, room_data: dict) -> dict:
 
     await save_gs(room_code, gs)
 
-    # ★ 기존 WS 연결 백업
+    # 기존 WS 연결 백업
     old_ws_map: dict = {}
     if room_code in sessions:
         old_task = sessions[room_code].get("phase_task")
         if old_task and not old_task.done():
             old_task.cancel()
-        # 살아있는 WS 연결만 백업
         for uid, p in sessions[room_code]["players"].items():
             if not p.get("isAI") and p.get("ws"):
                 old_ws_map[uid] = p
 
-    # 새 세션 생성 (status=waiting, players 비움)
     sessions[room_code] = {
         "players":    {},
         "phase_task": None,
         "status":     "waiting",
     }
 
-    # ★ 기존 WS 연결 복원 (gs["players"]에 있는 실제 플레이어만)
+    # 기존 WS 복원
     for uid, p in old_ws_map.items():
         if uid in gs["players"] and not gs["players"][uid].get("isAI"):
             pinfo = gs["players"][uid]
@@ -497,7 +458,7 @@ def check_win(gs: dict) -> str | None:
 
 
 # ================================================================
-# 페이즈 루프
+# 페이즈 루프 — ★ tick 매 초 전송
 # ================================================================
 async def phase_loop(room_code: str):
     print(f"[Phase] {room_code} 루프 시작", flush=True)
@@ -514,11 +475,11 @@ async def phase_loop(room_code: str):
                 "time":  wait,
             })
 
-            for rem in range(wait, 0, -1):
+            # ★ 매 초 tick (wait초부터 0까지)
+            for rem in range(wait - 1, -1, -1):
                 if room_code not in sessions: return
                 await asyncio.sleep(1)
-                if rem % 5 == 0 or rem <= 5:
-                    await broadcast(room_code, {"t": "tick", "time": rem - 1})
+                await broadcast(room_code, {"t": "tick", "time": rem})
 
             if room_code not in sessions: return
             gs = await load_gs(room_code)
@@ -532,18 +493,19 @@ async def phase_loop(room_code: str):
                 gs["phase"] = "morning"
                 await save_gs(room_code, gs)
 
+                morning_wait = PHASE_TIMES["morning"]
                 await broadcast(room_code, {
                     "t":      "phase",
                     "phase":  "morning",
                     "day":    gs["day"],
-                    "time":   PHASE_TIMES["morning"],
+                    "time":   morning_wait,
                     "result": mr,
                 })
-                for rem in range(PHASE_TIMES["morning"], 0, -1):
+                # ★ 아침도 매 초 tick
+                for rem in range(morning_wait - 1, -1, -1):
                     if room_code not in sessions: return
                     await asyncio.sleep(1)
-                    if rem % 5 == 0 or rem <= 5:
-                        await broadcast(room_code, {"t": "tick", "time": rem - 1})
+                    await broadcast(room_code, {"t": "tick", "time": rem})
 
                 gs     = await load_gs(room_code)
                 winner = check_win(gs)
@@ -617,38 +579,22 @@ def _calc_gd_blocked(gs: dict) -> list:
             blocked.append(tgt)
     return blocked
 
-
-# ================================================================
-# ★ 수정: phase_loop 시작 여부를 안전하게 결정하는 헬퍼
-#
-# 기존 로직: status=="waiting" 이어야만 True
-# 변경: WS 복원 후 이미 players가 채워져 있으므로 "waiting" 상태에서
-#       모든 실제 플레이어가 접속 완료면 True
-# ================================================================
 def _should_start_loop(room_code: str, gs: dict) -> bool:
     s = sessions.get(room_code)
     if not s: return False
     if s["status"] != "waiting": return False
-    # 이미 실행 중인 루프가 있으면 중복 시작 금지
     task = s.get("phase_task")
     if task and not task.done(): return False
-
     real_uids = [u for u, p in gs.get("players", {}).items() if not p.get("isAI")]
     connected = [u for u in s["players"] if not s["players"][u].get("isAI")]
     return len(real_uids) > 0 and set(real_uids) == set(connected)
 
-
 def _ensure_loop_running(room_code: str) -> bool:
-    """
-    ★ 신규: status가 playing인데 루프 태스크가 없거나 죽었으면 재시작.
-    join 재수신 시 호출.
-    반환값: 루프를 새로 시작했으면 True
-    """
     s = sessions.get(room_code)
     if not s: return False
     if s["status"] != "playing": return False
     task = s.get("phase_task")
-    if task and not task.done(): return False  # 이미 돌고 있음
+    if task and not task.done(): return False
     s["phase_task"] = asyncio.create_task(phase_loop(room_code))
     print(f"[Loop] {room_code} 루프 재시작 (ensure)", flush=True)
     return True
@@ -685,14 +631,12 @@ async def http_room_start(request: Request):
     if not room_code:
         return JSONResponse({"ok": False, "error": "room_code required"}, 400)
 
-    # 이미 playing 중이면 재시작 금지 (재연결이면 그냥 ok 반환)
     if room_code in sessions:
         s = sessions[room_code]
         if s["status"] == "playing":
             print(f"[HTTP] {room_code} 이미 진행 중 → 재시작 무시", flush=True)
             return JSONResponse({"ok": True, "already": True})
         elif s["status"] == "ended":
-            print(f"[HTTP] {room_code} 이미 종료됨 → 재시작 불가", flush=True)
             return JSONResponse({"ok": False, "error": "game_ended"}, 400)
 
     if not room_data:
@@ -703,30 +647,25 @@ async def http_room_start(request: Request):
     if room_data.get("hostId", "") != host_uid:
         return JSONResponse({"ok": False, "error": "not host"}, 403)
 
-    # ★ init_session이 내부에서 기존 WS 복원까지 처리
     gs = await init_session(room_code, room_data)
     await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "playing"})
 
     s = sessions[room_code]
     real_uids = [uid for uid, p in gs["players"].items() if not p.get("isAI")]
 
-    # AI만 있는 방은 즉시 루프 시작
     if len(real_uids) == 0:
         s["status"]     = "playing"
         s["phase_task"] = asyncio.create_task(phase_loop(room_code))
         print(f"[HTTP] {room_code} 전원 AI → 루프 즉시 시작", flush=True)
+    elif _should_start_loop(room_code, gs):
+        s["status"]     = "playing"
+        s["phase_task"] = asyncio.create_task(phase_loop(room_code))
+        connected = [u for u in s["players"] if not s["players"][u].get("isAI")]
+        print(f"[HTTP] {room_code} WS복원으로 전원 접속 ({len(connected)}/{len(real_uids)}) → 루프 즉시 시작", flush=True)
     else:
-        # ★ WS가 이미 복원된 상태이므로 바로 루프 시작 가능한지 체크
-        if _should_start_loop(room_code, gs):
-            s["status"]     = "playing"
-            s["phase_task"] = asyncio.create_task(phase_loop(room_code))
-            connected = [u for u in s["players"] if not s["players"][u].get("isAI")]
-            print(f"[HTTP] {room_code} WS복원으로 전원 접속 확인 ({len(connected)}/{len(real_uids)}) → 루프 즉시 시작", flush=True)
-        else:
-            connected = [u for u in s["players"] if not s["players"][u].get("isAI")]
-            print(f"[HTTP] {room_code} 대기 중 ({len(connected)}/{len(real_uids)}명 접속)", flush=True)
+        connected = [u for u in s["players"] if not s["players"][u].get("isAI")]
+        print(f"[HTTP] {room_code} 대기 중 ({len(connected)}/{len(real_uids)}명 접속)", flush=True)
 
-    print(f"[HTTP] 시작 room={room_code} host={host_uid} real={len(real_uids)}명", flush=True)
     return JSONResponse({"ok": True, "room_code": room_code})
 
 
@@ -759,7 +698,6 @@ async def ws_mafia(ws: WebSocket):
             except: continue
             t = msg.get("t", "")
 
-            # ── 참가 ─────────────────────────────────────────
             if t == "join":
                 uid       = msg.get("uid", "")
                 room_code = msg.get("room_code", "").upper().strip()
@@ -775,7 +713,6 @@ async def ws_mafia(ws: WebSocket):
 
                 pinfo = gs["players"][uid]
 
-                # 재연결 시 기존 ws 교체 (이전 연결 정리)
                 existing = sessions[room_code]["players"].get(uid)
                 if existing and existing.get("ws") is not ws:
                     try: await existing["ws"].close()
@@ -791,15 +728,17 @@ async def ws_mafia(ws: WebSocket):
 
                 my_role = gs["roles"].get(uid, "citizen")
 
+                # ★ joined에 roles 전체 포함 → 클라이언트가 my_role을 직접 파악 가능
                 await ws.send_text(json.dumps({
-                    "t":         "joined",
-                    "uid":       uid,
-                    "role":      my_role,
-                    "phase":     gs["phase"],
-                    "day":       gs["day"],
-                    "alive":     gs["alive"],
-                    "players":   gs["players"],
-                    "tie_pool":  gs["tie_pool"],
+                    "t":       "joined",
+                    "uid":     uid,
+                    "role":    my_role,
+                    "roles":   gs["roles"],
+                    "phase":   gs["phase"],
+                    "day":     gs["day"],
+                    "alive":   gs["alive"],
+                    "players": gs["players"],
+                    "tie_pool": gs["tie_pool"],
                     "mafia_team": {
                         pid: r for pid, r in gs["roles"].items() if r == "mafia"
                     } if my_role in ("mafia", "anchor") else {},
@@ -807,31 +746,21 @@ async def ws_mafia(ws: WebSocket):
 
                 s = sessions[room_code]
 
-                # ★ 루프 시작 판단
-                # Case 1: status==waiting, 전원 접속 완료 → 루프 시작
                 if _should_start_loop(room_code, gs):
                     s["status"]     = "playing"
                     s["phase_task"] = asyncio.create_task(phase_loop(room_code))
                     real_uids = [u for u, p in gs["players"].items() if not p.get("isAI")]
                     connected = [u for u in s["players"] if not s["players"][u].get("isAI")]
                     print(f"[WS] {room_code} 전원 접속 ({len(connected)}/{len(real_uids)}) → 루프 시작", flush=True)
-
-                # ★ Case 2: status==playing인데 루프가 죽었으면 재시작
-                # (HTTP /room/start 에서 WS복원으로 이미 playing이 된 경우 join이 다시 오면 여기서 처리)
                 elif _ensure_loop_running(room_code):
                     print(f"[WS] {room_code} join 재수신 → 루프 재시작", flush=True)
-
                 else:
                     real_uids = [u for u, p in gs["players"].items() if not p.get("isAI")]
                     connected = [u for u in s["players"] if not s["players"][u].get("isAI")]
-                    print(f"[WS] {room_code} joined uid={uid} status={s['status']} {len(connected)}/{len(real_uids)}명", flush=True)
+                    print(f"[WS] joined uid={uid} status={s['status']} {len(connected)}/{len(real_uids)}명", flush=True)
 
-                await broadcast(room_code, {
-                    "t":   "player_joined",
-                    "uid": uid,
-                }, exclude=uid)
+                await broadcast(room_code, {"t": "player_joined", "uid": uid}, exclude=uid)
 
-            # ── 밤 행동 ──────────────────────────────────────
             elif t == "night_action":
                 if not (uid and room_code and room_code in sessions): continue
                 gs = await load_gs(room_code)
@@ -874,7 +803,6 @@ async def ws_mafia(ws: WebSocket):
                             "lang": msg.get("lang", "python")
                         }))
 
-            # ── 낮 투표 ──────────────────────────────────────
             elif t == "day_vote":
                 if not (uid and room_code and room_code in sessions): continue
                 gs = await load_gs(room_code)
@@ -884,7 +812,6 @@ async def ws_mafia(ws: WebSocket):
                 await save_gs(room_code, gs)
                 await ws.send_text(json.dumps({"t": "vote_ok"}))
 
-            # ── 채팅 ─────────────────────────────────────────
             elif t == "chat":
                 if not (uid and room_code and room_code in sessions): continue
                 gs      = await load_gs(room_code)
@@ -924,7 +851,6 @@ async def ws_mafia(ws: WebSocket):
                         if r in ("mafia", "anchor"):
                             await send_to(room_code, pid, chat_msg)
 
-            # ── 감정 ─────────────────────────────────────────
             elif t == "emotion":
                 if not (uid and room_code): continue
                 gs = await load_gs(room_code)
